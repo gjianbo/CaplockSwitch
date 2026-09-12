@@ -1,0 +1,192 @@
+name: Build
+
+# ---------------------------------------------------------------------------
+# 触发时机
+#   push   → 合入 master/main 时构建一次，保证主干随时可编译
+#   tag v* → 构建并自动创建 Release，附上可下载的压缩包
+#   PR     → 拦截坏提交
+#   手动    → 需要时在 Actions 页面点一下
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+# 默认只读即可。写权限只在 release job 上单独开，最小权限原则。
+permissions:
+  contents: read
+
+# 同一分支连续推送时，取消上一次还没跑完的构建；PR 上尤其有用。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # =========================================================================
+  # 构建：一次产出 x64 + x86 两个 exe
+  # =========================================================================
+  build:
+    name: Build (MSVC, x64 + x86)
+    runs-on: windows-latest        # 自带 Visual Studio 2022 + Windows SDK，无需安装任何东西
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 构建失败时最常见的两个原因是「runner 镜像换版」和「SDK 版本漂移」，
+      # 所以先把环境打出来，出问题一眼就能定位。
+      - name: Report toolchain
+        shell: pwsh
+        run: |
+          Write-Host "== OS =="
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture | Format-List
+          Write-Host "== Visual Studio =="
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+          Write-Host "== Windows SDK =="
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+
+      # 走 build.bat：内部用 vswhere 定位 VS，再经 vcvarsall 初始化环境，
+      # 然后在 x64 / x86 两个架构下各自编译 + 链接一次。
+      # 注意必须写 call —— 直接写 build.bat 会把控制流交给它，后续步骤不再执行。
+      - name: Build
+        shell: cmd
+        run: call build.bat
+
+      # 规格要求「零运行时依赖」。这里不当口号，直接扫 PE 导入表里的 DLL 名，
+      # 出现 VCRUNTIME / MSVCP / ucrtbase 之类的动态运行库就判定失败。
+      # 静态 CRT 构建下这些名字不应出现在产物中。
+      - name: Verify zero runtime dependencies
+        shell: pwsh
+        run: |
+          $forbidden = 'VCRUNTIME', 'MSVCP', 'ucrtbase', 'MSVCR', 'api-ms-win-crt'
+          $failed = $false
+
+          foreach ($exe in 'bin\CapsSwitch-x64.exe', 'bin\CapsSwitch-x86.exe') {
+            $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+            $dlls = [regex]::Matches($text, '(?i)[A-Za-z0-9_.\-]{3,}\.dll') |
+                      ForEach-Object { $_.Value.ToUpper() } |
+                      Sort-Object -Unique
+
+            Write-Host "== $exe =="
+            Write-Host "   导入: $($dlls -join ', ')"
+
+            $bad = @($dlls | Select-String -Pattern $forbidden -SimpleMatch)
+            if ($bad.Count -gt 0) {
+              Write-Host "   [FAIL] 出现非预期的运行库依赖" -ForegroundColor Red
+              $failed = $true
+            }
+          }
+
+          if ($failed) {
+            throw '产物不再是零运行时依赖，请检查是否误用了动态 CRT（/MD）。'
+          }
+          Write-Host "`n零运行时依赖校验通过。" -ForegroundColor Green
+
+      # 用程序自带的 --selftest 做冒烟测试。
+      #
+      # 为什么不用「启动后看进程还活着」：托盘挂载失败时程序会弹一个**阻塞的**
+      # MessageBox（见 main.cpp 的 Tray_Add 分支），进程会一直挂在那儿，
+      # 「还活着」的断言反而会把失败判成通过。
+      #
+      # --selftest 让程序照常走完初始化链路（消息宿主窗口 -> 托盘图标 ->
+      # 键盘钩子 -> 全局热键），全部成功返回 0，否则用退出码指明卡在哪一环，
+      # 全程不弹对话框、不进消息循环。
+      - name: Smoke test (self check)
+        shell: pwsh
+        run: |
+          $exe  = Resolve-Path 'bin\CapsSwitch-x64.exe'
+          $code = (Start-Process -FilePath $exe.Path -ArgumentList '--selftest' -PassThru -Wait).ExitCode
+
+          $meaning = @{
+            0 = '初始化全部成功'
+            1 = '单实例互斥体创建失败'
+            2 = '已有实例在运行'
+            3 = '消息宿主窗口类注册失败'
+            4 = '消息宿主窗口创建失败'
+            5 = '托盘图标挂载失败（Shell_NotifyIcon）'
+            6 = '键盘钩子安装失败（SetWindowsHookEx）'
+          }
+
+          if ($code -ne 0) {
+            $why = if ($meaning.ContainsKey($code)) { $meaning[$code] } else { '未知错误码' }
+            $hasShell = @(Get-Process explorer -ErrorAction SilentlyContinue).Count -gt 0
+            Write-Host "explorer.exe 正在运行: $hasShell" -ForegroundColor Yellow
+            if ($code -eq 5 -and -not $hasShell) {
+              Write-Host '[提示] 该会话没有桌面外壳，托盘图标本就挂不上，属环境限制而非代码缺陷。' -ForegroundColor Yellow
+            }
+            throw "自检失败：退出码 $code —— $why"
+          }
+
+          Write-Host '自检通过：消息窗口 / 托盘 / 键盘钩子 / 全局热键 四条链路全部就绪。' -ForegroundColor Green
+
+      # 把要交付的东西摊平到 dist/，这样下载下来的压缩包是干净的，
+      # 不会带上下载时的目录层级。
+      - name: Stage deliverables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item bin\CapsSwitch-x64.exe  dist\
+          Copy-Item bin\CapsSwitch-x86.exe  dist\
+          Copy-Item icons\IDI_ON.ico        dist\
+          Copy-Item icons\IDI_OFF.ico       dist\
+          Copy-Item README.txt              dist\
+          Copy-Item CapsSwitch.ini          dist\
+
+          Write-Host '== 交付物 =='
+          Get-ChildItem dist | Sort-Object Name |
+            Select-Object Name, @{n='Size';e={ $_.Length }}, LastWriteTime | Format-Table -AutoSize
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapsSwitch-windows
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
+
+  # =========================================================================
+  # 发布：只在打 v* 标签时触发，把构建产物挂到 Release 上
+  # =========================================================================
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write          # 创建 Release 需要写权限，只在这个 job 开放
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: CapsSwitch-windows
+          path: dist
+
+      - name: Package
+        run: |
+          ls -l dist
+          cd dist
+          # -j（junk paths）保证压缩包内是纯文件名，不带 dist/ 前缀。
+          zip -9 -j "../CapsSwitch-${GITHUB_REF_NAME}.zip" ./*
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 除整包外，两个 exe 也单独挂上去，方便「下载即用」。
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "CapsSwitch ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "CapsSwitch-${GITHUB_REF_NAME}.zip" \
+            dist/CapsSwitch-x64.exe \
+            dist/CapsSwitch-x86.exe

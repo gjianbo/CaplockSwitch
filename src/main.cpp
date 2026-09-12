@@ -259,6 +259,112 @@ static BOOL RegisterMainClass(void)
 }
 
 // ---------------------------------------------------------------------------
+// 命令行与收尾
+// ---------------------------------------------------------------------------
+
+/**
+ * 把 ASCII 小写字母转成大写，其余字符原样返回。
+ *
+ * @param c 待转换字符。
+ * @return 转换结果。
+ */
+static wchar_t UpperAscii(wchar_t c)
+{
+    return (c >= L'a' && c <= L'z') ? (wchar_t)(c - L'a' + L'A') : c;
+}
+
+/**
+ * 判断命令行里是否出现了指定开关。
+ *
+ * 按空白切词后做「整词 + 不区分大小写」的比较：整词匹配可以避免
+ * --selftest-verbose 这类前缀相同的参数被误判成 --selftest；
+ * 带引号的参数（exe 自身路径通常带引号）会先剥掉引号再比较。
+ *
+ * 这里刻意不用 CRT 的 wcsstr / _wcsicmp —— 本工程有一条完全不链接
+ * CRT 的构建路径（见 crt_free.cpp），选型上要整体避开 CRT 函数。
+ *
+ * @param cmdLine GetCommandLineW() 的返回值，含 exe 自身路径。
+ * @param sw      要匹配的开关，例如 CAPS_SELFTEST_SWITCH。
+ * @return 该开关作为独立的一个词出现时返回 TRUE。
+ */
+static BOOL HasSwitch(LPCWSTR cmdLine, LPCWSTR sw)
+{
+    if (cmdLine == NULL || sw == NULL) {
+        return FALSE;
+    }
+
+    const int swLen = lstrlenW(sw);
+
+    for (LPCWSTR p = cmdLine; *p != L'\0'; ) {
+        while (*p == L' ' || *p == L'\t') {
+            ++p;
+        }
+        if (*p == L'\0') {
+            break;
+        }
+
+        LPCWSTR word = p;
+        if (*word == L'"') {
+            ++word;
+            while (*p != L'\0' && *p != L'"') {
+                ++p;
+            }
+            if (*p == L'"') {
+                ++p;
+            }
+        } else {
+            while (*p != L'\0' && *p != L' ' && *p != L'\t') {
+                ++p;
+            }
+        }
+
+        if ((int)(p - word) != swLen) {
+            continue;
+        }
+
+        int i = 0;
+        for (; i < swLen; ++i) {
+            if (UpperAscii(word[i]) != UpperAscii(sw[i])) {
+                break;
+            }
+        }
+        if (i == swLen) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/**
+ * 进程退出前的统一收尾。
+ *
+ * 每一步都自带「尚未初始化」的判断，所以在任何阶段调用都是安全的 ——
+ * 这正是自检模式需要的：还没进消息循环就得能干净退出。
+ * 调用后 g_app.hWnd 会被置空，重复调用不会二次 DestroyWindow。
+ */
+static void Teardown(void)
+{
+    Hook_Uninstall();          // 未安装时空操作
+
+    if (g_app.hWnd != NULL) {
+        UnregisterHotKey(g_app.hWnd, IDH_TOGGLE);
+    }
+
+    Tray_Remove();             // 未挂载时空操作
+
+    DestroyOwnedIcon(&g_app.hIconOn,  g_iconOnShared);
+    DestroyOwnedIcon(&g_app.hIconOff, g_iconOffShared);
+
+    Settings_Shutdown();       // 幂等：内部有 NULL 判断
+
+    if (g_app.hWnd != NULL) {
+        DestroyWindow(g_app.hWnd);
+        g_app.hWnd = NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
@@ -271,16 +377,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     // 让托盘图标与窗口按物理像素渲染，避免高 DPI 下被系统拉伸。
     SetProcessDPIAware();
 
+    // 自检模式：走完初始化后立即退出，用退出码报告结果，全程不弹对话框。
+    // 详见 app.h 中 CAPS_SELFTEST_SWITCH 的说明。
+    const BOOL selftest = HasSwitch(GetCommandLineW(), CAPS_SELFTEST_SWITCH);
+
     // ---- 单实例 ----
     HANDLE mutex = CreateMutexW(NULL, TRUE, CAPS_MUTEX_NAME);
     if (mutex == NULL) {
-        return 1;
+        return SELFTEST_ERR_MUTEX;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(mutex);
+        if (selftest) {
+            return SELFTEST_ERR_ALREADY_RUN;
+        }
         MessageBoxW(NULL,
                     L"CapsSwitch 已经在运行了。\n请在任务栏通知区域查看它的托盘图标。",
                     CAPS_APP_NAME, MB_OK | MB_ICONINFORMATION);
-        CloseHandle(mutex);
         return 0;
     }
 
@@ -317,29 +430,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     // ---- 消息宿主窗口（创建后不 ShowWindow，保持隐藏）----
     if (!RegisterMainClass()) {
         CloseHandle(mutex);
-        return 1;
+        return SELFTEST_ERR_CLASS;
     }
 
     g_app.hWnd = CreateWindowExW(0, CAPS_WNDCLASS_MAIN, CAPS_APP_NAME, WS_OVERLAPPED,
                                  0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (g_app.hWnd == NULL) {
         CloseHandle(mutex);
-        return 1;
+        return SELFTEST_ERR_WINDOW;
     }
 
     // ---- 托盘 ----
     if (!Tray_Add(g_app.hWnd)) {
-        MessageBoxW(NULL, L"无法创建托盘图标，程序即将退出。",
-                    CAPS_APP_NAME, MB_OK | MB_ICONERROR);
-        DestroyWindow(g_app.hWnd);
+        if (!selftest) {
+            MessageBoxW(NULL, L"无法创建托盘图标，程序即将退出。",
+                        CAPS_APP_NAME, MB_OK | MB_ICONERROR);
+        }
+        Teardown();
         CloseHandle(mutex);
-        return 1;
+        return SELFTEST_ERR_TRAY;
     }
 
     // ---- 键盘钩子（仅在启用状态下安装）----
     if (g_app.enabled && !Hook_Install()) {
         g_app.enabled = FALSE;   // 保持内存状态与真实能力一致，但不落盘
         Tray_Refresh();
+
+        if (selftest) {
+            // 自检模式下这是硬失败：把 Caps 重映射出去是本程序存在的全部
+            // 意义，钩子装不上就没有可交付的东西了。
+            Teardown();
+            CloseHandle(mutex);
+            return SELFTEST_ERR_HOOK;
+        }
+
         MessageBoxW(NULL,
                     L"键盘钩子安装失败，已临时切换到暂停模式。\n"
                     L"请检查安全软件是否拦截了本程序，再从托盘菜单重新启用。",
@@ -349,6 +473,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     // ---- 全局热键 Ctrl+Alt+C ----
     // 失败不致命（可能是被别的软件占了），只是少一个快捷入口。
     RegisterHotKey(g_app.hWnd, IDH_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
+
+    // ---- 自检模式在此收工 ----
+    // 能走到这里，说明消息宿主窗口、托盘图标、键盘钩子、全局热键四条链路
+    // 都已就绪。不需要进消息循环，清理后返回 0 即可。
+    if (selftest) {
+        Teardown();
+        CloseHandle(mutex);
+        return SELFTEST_OK;
+    }
 
     // ---- 消息循环 ----
     // 设置窗口不是真正的对话框，靠 IsDialogMessage 补上 Tab 遍历、
@@ -362,12 +495,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
 
     // ---- 收尾 ----
-    Hook_Uninstall();
-    UnregisterHotKey(g_app.hWnd, IDH_TOGGLE);
-    Tray_Remove();
-    DestroyOwnedIcon(&g_app.hIconOn,  g_iconOnShared);
-    DestroyOwnedIcon(&g_app.hIconOff, g_iconOffShared);
-    Settings_Shutdown();
+    Teardown();
     CloseHandle(mutex);
 
     return (int)msg.wParam;

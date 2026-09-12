@@ -41,8 +41,19 @@ echo.
 if not exist bin mkdir bin
 if not exist obj mkdir obj
 
-rem vcvarsall 会改写 PATH/INCLUDE/LIB，切架构前先还原一次，避免残留污染。
+rem vcvarsall 会改写 PATH / INCLUDE / LIB / LIBPATH。这里在第一次调用前把原始
+rem 环境整体快照下来，之后每次切架构都先还原再 call，杜绝上一轮的 x64 路径残留
+rem 到 x86 编译里（典型症状：链接期报 LNK1112「模块计算机类型冲突」）。
+rem
+rem 依据：vcvarsall 默认并不重置这些变量 —— 它转调的 vsdevcmd\ext\vcvars.bat 里
+rem 写的是 set "LIB=%__VCVARS_ADD_TO_LIB%;%LIB%"（前置追加），vsdevcmd.bat 里
+rem 写的是 set "INCLUDE=%__VSCMD_INCLUDE_ORDER%%INCLUDE%"（同样是前置追加）。
+rem 只有显式传 /clean_env 才会清空，而那条路径会跳过架构初始化。所以同一进程内
+rem 连续切两次架构，第二次一定拿到被污染的 INCLUDE/LIB。
 set "PATHBAK=%PATH%"
+set "INCLUDEBAK=%INCLUDE%"
+set "LIBBAK=%LIB%"
+set "LIBPATHBAK=%LIBPATH%"
 
 call :vcenv x64
 if errorlevel 1 goto :novs
@@ -100,7 +111,11 @@ echo.
 exit /b 0
 
 :vcenv
+rem 参数：x64 / x86。先把环境还原到脚本启动时的原始状态，再交给 vcvarsall。
 set "PATH=%PATHBAK%"
+set "INCLUDE=%INCLUDEBAK%"
+set "LIB=%LIBBAK%"
+set "LIBPATH=%LIBPATHBAK%"
 call "%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat" %1 >nul
 if errorlevel 1 exit /b 1
 exit /b 0

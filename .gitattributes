@@ -1,0 +1,28 @@
+# 换行符策略：谁都别让 Git 擅自转换。
+#
+# 重点在 *.bat —— cmd.exe 解析批处理时按字节偏移找标签，LF-only 的文件会让
+# goto/call :label 跳错位置，症状是「找不到批次标签」或在错误的行继续执行。
+# 所以 Windows 批处理必须保持 CRLF 入库。build.bat 曾经是 LF，已修正。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Unix shell 脚本保持 LF，否则 Git Bash 下会报「/usr/bin/env: bash^M」。
+*.sh  text eol=lf
+*.py  text eol=lf
+
+# 普通文本统一以 LF 入库（Git 会在检出时按平台处理）。
+*.txt  text
+*.md   text
+*.ini  text
+*.yml  text
+*.yaml text
+*.cpp  text
+*.h    text
+*.rc   text
+*.manifest text
+
+# 二进制文件禁止任何转换与 diff。
+*.exe   binary
+*.ico   binary
+*.png   binary
+*.res   binary

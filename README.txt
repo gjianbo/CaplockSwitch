@@ -44,6 +44,24 @@ CapsSwitch 1.0 — 使用说明
     启用    绿色图标，tooltip 显示「已启用（Caps→输入法，Shift+Caps→大写）」
     暂停    灰色图标，tooltip 显示「已暂停（原生 Caps Lock）」
 
+命令行自检
+    CapsSwitch-x64.exe --selftest & echo %ERRORLEVEL%
+
+    带上这个参数启动时，程序照常走完整个初始化流程（消息宿主窗口 ->
+    托盘图标 -> 键盘钩子 -> 全局热键），然后立即退出并用退出码报告结果，
+    全程不弹任何对话框。退出码含义：
+
+        0    初始化全部成功
+        1    单实例互斥体创建失败
+        2    已有实例在运行
+        3    消息宿主窗口类注册失败
+        4    消息宿主窗口创建失败
+        5    托盘图标挂载失败（Shell_NotifyIcon）
+        6    键盘钩子安装失败（SetWindowsHookEx）
+
+    适合放在安装脚本里做环境预检，或者排查「为什么这台机器上没生效」。
+    CI 的冒烟测试用的就是它（原因见第六节）。
+
 
 四、配置文件
 -------------------------------------------------------------------------------
@@ -99,6 +117,32 @@ Git Bash / MSYS2（不依赖注册表定位 SDK，实测验证过的路径）：
     两张设计稿，裁掉透明留白后按面积平均降采样，再打包成含
     16x16 / 32x32 两档的 ICO。换图标时直接替换这两张 PNG 重跑即可。
 
+持续集成（GitHub Actions）
+    .github\workflows\build.yml 在每次 push / PR 时自动构建，产物可在
+    Actions 页面下载（artifact 名 CapsSwitch-windows，保留 30 天）。
+    打 v* 标签（例如 git tag v1.0 && git push origin v1.0）会额外创建一个
+    Release，并附上打包好的 CapsSwitch-<标签名>.zip。
+
+    流水线里除了构建，还跑两条有实际意义的断言：
+      * 零运行时依赖校验 —— 扫 PE 导入表里的 DLL 名，一旦出现
+        VCRUNTIME / MSVCP / ucrtbase 之类就判定失败。规格里「零运行时
+        依赖」是一条硬指标，这里用 CI 守住它，而不是靠人工自觉。
+      * 冒烟测试 —— 用程序自带的 --selftest 开关（见第三节的「命令行
+        自检」）跑一遍初始化，退出码不为 0 即失败。
+
+    这里刻意没有采用「启动 exe 等 3 秒、看进程是否还活着」这种常见写法：
+    托盘挂载失败时程序会弹一个**阻塞的** MessageBox，进程会一直挂在那儿，
+    「还活着」的断言反而会把失败判成通过。用 --selftest 才能拿到确定的
+    结论，而且失败时能直接看出是卡在哪一环。
+
+    如果哪天 runner 会话确实没有桌面外壳（explorer.exe 未运行），
+    自检会返回 5 并在日志里给出提示 —— 那属于环境限制，不是代码缺陷。
+
+    本地自检（改了 workflow 后建议跑一次）：
+        python tools\lint_workflow.py
+        它把 yml 里每个步骤的 run 脚本抽成独立文件放到 obj\lint\，
+        方便逐个过语法检查，同时核对 ${{ }} 表达式是否配对。
+
 
 七、兼容性与已知限制
 -------------------------------------------------------------------------------
@@ -147,6 +191,9 @@ icons\IDI_ON.ico     由设计稿生成的托盘图标（16x16 + 32x32）
 icons\IDI_OFF.ico    同上
 tools\make_icons.py  图标生成脚本（纯标准库）
 tools\build_local.sh 不依赖注册表的构建脚本（Git Bash / MSYS2）
+tools\lint_workflow.py  从 workflow yml 抽取脚本块做语法自检
+.github\workflows\build.yml  GitHub Actions 构建 + 发布流水线
+.gitattributes       换行符策略（重要：*.bat 必须 CRLF 入库）
 
 
 九、实现说明（相对规格书的几处落地取舍）
@@ -182,11 +229,34 @@ tools\build_local.sh 不依赖注册表的构建脚本（Git Bash / MSYS2）
    开机启动」一律以注册表 Run 项为准，避免两边不一致。写失败时不会
    只改内存状态，菜单勾选与实际行为永远同步。
 
-5) 规格未提但补上的两点
+5) 规格未提但补上的三点
 
    * Explorer 崩溃重启后会广播 TaskbarCreated，不重新挂载的话托盘图标
      会永久消失。tray.cpp 已处理。
    * 按住 Caps 不放时系统会产生自动重复的 KEYDOWN，这里只在首次按下
      发送快捷键，避免连发一串切换。
+   * --selftest 命令行自检（退出码见 app.h 的 CapsSelfTestExit）。
+     起因是无人值守环境需要一个可靠的「这程序到底能不能跑」判据：正常
+     模式下初始化失败会弹阻塞的 MessageBox，脚本只能看到「进程还在」，
+     会把失败当成功。自检模式把整条初始化链路的结果收敛成一个退出码，
+     且全程不弹窗、不进消息循环。
+
+6) 上 CI 时修掉的两个 build.bat 隐患
+
+   * 换行符：build.bat 原先以 LF 入库。cmd.exe 解析批处理是按字节偏移
+     找标签的，LF-only 的文件会让 goto / call :label 跳到错误位置，症状
+     是「找不到批次标签」或在错误的行继续往下执行。已改为 CRLF，并在
+     .gitattributes 里用 *.bat text eol=crlf 钉死，防止再次被检出成 LF。
+   * 环境残留：build.bat 在同一个 cmd 进程里连续调用两次 vcvarsall
+     （先 x64 再 x86），而 vcvarsall 默认并**不会**重置 INCLUDE / LIB。
+     它内部转调的 vsdevcmd\ext\vcvars.bat 写的是前置追加：
+         set "LIB=%__VCVARS_ADD_TO_LIB%;%LIB%"
+     vsdevcmd.bat 对 INCLUDE 同样是前置追加。只有显式传 /clean_env 才会
+     清空，而那条路径会直接跳过架构初始化。所以第二轮编译会带着 x64 的
+     LIB 路径，链接期可能报 LNK1112「模块计算机类型冲突」。
+     现在在第一次调用前把 PATH / INCLUDE / LIB / LIBPATH 整体快照，
+     每次切架构前先还原再 call。
+     （tools\build_local.sh 没这个问题——它每个架构都自己重新拼 INCLUDE
+     和 LIB，所以本机一直没暴露出来。）
 
 ===============================================================================
