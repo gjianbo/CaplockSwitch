@@ -114,8 +114,10 @@ void Tray_ShowMenu(HWND owner)
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, IDM_STATE_ENABLE, L"启用（Caps→输入法）");
-    AppendMenuW(menu, MF_STRING, IDM_STATE_PAUSE,  L"暂停（原生 Caps）");
+    // 右侧用 \t 标出键盘等价操作，让用户看得见 Ctrl+Caps 这个切换键。
+    // 它不带托盘图标也能用，是程序唯一的键盘唤入口。
+    AppendMenuW(menu, MF_STRING, IDM_STATE_ENABLE, L"启用（Caps→输入法）\tCtrl+Caps");
+    AppendMenuW(menu, MF_STRING, IDM_STATE_PAUSE,  L"暂停（原生 Caps）\tCtrl+Caps");
     CheckMenuRadioItem(menu, IDM_STATE_ENABLE, IDM_STATE_PAUSE,
                        (UINT)(g_app.enabled ? IDM_STATE_ENABLE : IDM_STATE_PAUSE),
                        MF_BYCOMMAND);

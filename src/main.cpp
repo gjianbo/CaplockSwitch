@@ -95,19 +95,17 @@ void App_SetEnabled(BOOL enabled, BOOL persist)
         return;
     }
 
-    if (enabled) {
-        if (!Hook_Install()) {
-            // 钩子装不上（极少见，通常是被安全软件拦截）——
-            // 保持暂停状态，避免出现「显示已启用但实际不生效」的假象。
-            MessageBoxW(NULL,
-                        L"无法安装键盘钩子，CapsSwitch 仍处于暂停状态。\n"
-                        L"请检查安全软件是否拦截了本程序，然后重试。",
-                        CAPS_APP_NAME, MB_OK | MB_ICONWARNING);
-            Settings_SyncFromState();
-            return;
-        }
-    } else {
-        Hook_Uninstall();
+    // 钩子自启动起常驻，这里只翻标志位 —— 既不安装也不卸载，
+    // 因为暂停状态下还得靠它识别 Ctrl+Caps 把自己重新打开。
+    // 但有个例外：启动时钩子就没装上，那「已启用」只是个假象，
+    // 这种情况保持暂停并说明原因。
+    if (enabled && g_app.hHook == NULL) {
+        MessageBoxW(NULL,
+                    L"键盘钩子未安装，无法启用。\n"
+                    L"请检查安全软件是否拦截了本程序，然后重新启动 CapsSwitch。",
+                    CAPS_APP_NAME, MB_OK | MB_ICONWARNING);
+        Settings_SyncFromState();
+        return;
     }
 
     g_app.enabled = enabled;
@@ -224,6 +222,12 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         default:
             break;
         }
+        return 0;
+
+    case CAPS_WM_TOGGLE:
+        // 来自键盘钩子的 Ctrl+Caps。钩子回调跑在系统输入处理路径上、
+        // 必须尽快返回，所以它只投递这条消息，实际工作在这里做。
+        App_ToggleEnabled();
         return 0;
 
     case WM_HOTKEY:
@@ -451,8 +455,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         return SELFTEST_ERR_TRAY;
     }
 
-    // ---- 键盘钩子（仅在启用状态下安装）----
-    if (g_app.enabled && !Hook_Install()) {
+    // ---- 键盘钩子（常驻，与启用状态无关）----
+    // 必须在整个进程生命周期内挂着：暂停状态下还要靠它识别 Ctrl+Caps，
+    // 把程序重新打开。启用 / 暂停只是 g_app.enabled 这一个标志位。
+    // 也因此，自检模式一定会走到这一步 —— 配置写成暂停也照样验钩子。
+    if (!Hook_Install()) {
         g_app.enabled = FALSE;   // 保持内存状态与真实能力一致，但不落盘
         Tray_Refresh();
 
@@ -465,8 +472,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         }
 
         MessageBoxW(NULL,
-                    L"键盘钩子安装失败，已临时切换到暂停模式。\n"
-                    L"请检查安全软件是否拦截了本程序，再从托盘菜单重新启用。",
+                    L"键盘钩子安装失败，Caps 重映射与 Ctrl+Caps 切换都将无法工作。\n"
+                    L"请检查安全软件是否拦截了本程序。",
                     CAPS_APP_NAME, MB_OK | MB_ICONWARNING);
     }
 

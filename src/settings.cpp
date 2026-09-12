@@ -121,6 +121,13 @@ static void CreateControls(HWND hwnd)
                           BS_AUTOCHECKBOX | WS_TABSTOP,
                           kMargin, yEnable + 92, kRowW, 22, IDC_AUTOSTART);
 
+    // Ctrl+Caps 是程序唯一的键盘切换通路，但它不在本窗口的选项里，
+    // 用户容易不知道，所以在这里点一句。SS_ENDELLIPSIS 是兜底：
+    // 万一系统字号变大导致文字超宽，宁可截断成省略号也不越界压到按钮。
+    MakeControl(hwnd, L"STATIC", L"提示：Ctrl + Caps Lock 可随时切换启用 / 暂停",
+                SS_LEFT | SS_ENDELLIPSIS,
+                kMargin, yEnable + 116, kRowW, 18, IDC_LABEL_TOGGLEHINT);
+
     const int yBtn = kClientH - kMargin - kBtnH;
     MakeControl(hwnd, L"BUTTON", L"确定",
                 BS_DEFPUSHBUTTON | WS_TABSTOP,

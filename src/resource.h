@@ -18,7 +18,7 @@
 #define IDM_EXIT                 205    // 退出
 
 // ---- 全局热键 ID ----------------------------------------------------------
-#define IDH_TOGGLE               301    // Ctrl + Alt + C
+#define IDH_TOGGLE               301    // Ctrl + Alt + C（与 Ctrl+Caps 等效）
 
 // ---- 设置窗口子控件 ID ----------------------------------------------------
 #define IDC_ENABLE               401
@@ -27,3 +27,4 @@
 #define IDC_OK                   404
 #define IDC_CANCEL               405
 #define IDC_LABEL_HOTKEY         406
+#define IDC_LABEL_TOGGLEHINT     407    // 纯说明文字，不接收通知
