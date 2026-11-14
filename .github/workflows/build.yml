@@ -200,35 +200,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          notes="docs/releases/${GITHUB_REF_NAME}.md"
-          if [ -f "$notes" ]; then
-            echo "使用手写发布说明：$notes"
-            notes_args=(--notes-file "$notes")
-          else
-            echo "未找到 $notes，改为自动生成 changelog"
-            notes_args=(--generate-notes)
-          fi
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+          notes="docs/releases/${tag}.md"
+          pkg="CapsSwitch-${tag}.zip"
+          x64="dist/CapsSwitch-x64.exe"
+          x86="dist/CapsSwitch-x86.exe"
 
-          assets=(
-            "CapsSwitch-${GITHUB_REF_NAME}.zip"
-            "dist/CapsSwitch-x64.exe"
-            "dist/CapsSwitch-x86.exe"
-          )
+          has_notes=no
+          if [ -f "$notes" ]; then has_notes=yes; fi
 
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release 已存在，更新说明与附件（附件允许覆盖）"
-            # gh release edit 不支持 --generate-notes，只在有手写说明时更新正文。
-            if [ -f "$notes" ]; then
-              gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-                "${notes_args[@]}"
+          # 把决策写进 job summary：出问题时不用翻日志就能看出走了哪条分支。
+          {
+            echo "### 发布诊断"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| tag | \`${tag}\` |"
+            echo "| 说明文件 | \`${notes}\` |"
+            echo "| 说明文件存在 | ${has_notes} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release 已存在，更新说明与附件"
+            # 用 --notes 直接内联正文，不用 --notes-file：后者在重推 tag 的场景下
+            # 实测没有生效（正文回退成了 tag 附注），原因未查明，内联更可靠。
+            if [ "$has_notes" = yes ]; then
+              gh release edit "$tag" --repo "$repo" --notes "$(cat "$notes")"
             fi
-            gh release upload "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-              --clobber "${assets[@]}"
+            gh release upload "$tag" --repo "$repo" --clobber "$pkg" "$x64" "$x86"
+          elif [ "$has_notes" = yes ]; then
+            echo "新建 Release，使用手写发布说明"
+            gh release create "$tag" --repo "$repo" \
+              --title "CapsSwitch $tag" \
+              --notes "$(cat "$notes")" \
+              "$pkg" "$x64" "$x86"
           else
-            # 除整包外，两个 exe 也单独挂上去，方便「下载即用」。
-            gh release create "${GITHUB_REF_NAME}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "CapsSwitch ${GITHUB_REF_NAME}" \
-              "${notes_args[@]}" \
-              "${assets[@]}"
+            echo "未找到 ${notes}，新建 Release 并自动生成 changelog"
+            gh release create "$tag" --repo "$repo" \
+              --title "CapsSwitch $tag" \
+              --generate-notes \
+              "$pkg" "$x64" "$x86"
           fi
