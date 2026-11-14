@@ -166,6 +166,11 @@ jobs:
       contents: write          # 创建 Release 需要写权限，只在这个 job 开放
 
     steps:
+      # 取回仓库本身：发布说明放在 docs/releases/<tag>.md，需要读它。
+      # 仓库很小，直接整体 checkout，不值得为省几秒上 sparse-checkout。
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: CapsSwitch-windows
@@ -178,15 +183,52 @@ jobs:
           # -j（junk paths）保证压缩包内是纯文件名，不带 dist/ 前缀。
           zip -9 -j "../CapsSwitch-${GITHUB_REF_NAME}.zip" ./*
 
+      # ---------------------------------------------------------------------
+      # 发布说明的两种来源：
+      #   1. docs/releases/<tag>.md 存在 → 用它。手写说明能讲清「为什么改」，
+      #      而 --generate-notes 靠 PR 自动汇总，本项目是直接推 master 的，
+      #      生成出来只有一行 "Full Changelog"。
+      #   2. 文件不存在 → 退回 --generate-notes，至少不会发布失败。
+      #
+      # 这一段是幂等的：tag 被重新推一次（例如补写说明后重打标签）时，
+      # release 已经存在，gh release create 会直接报错退出，所以先探测再决定
+      # 走 create 还是 edit + upload --clobber。
+      # ---------------------------------------------------------------------
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 除整包外，两个 exe 也单独挂上去，方便「下载即用」。
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "CapsSwitch ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            "CapsSwitch-${GITHUB_REF_NAME}.zip" \
-            dist/CapsSwitch-x64.exe \
-            dist/CapsSwitch-x86.exe
+          set -euo pipefail
+
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes" ]; then
+            echo "使用手写发布说明：$notes"
+            notes_args=(--notes-file "$notes")
+          else
+            echo "未找到 $notes，改为自动生成 changelog"
+            notes_args=(--generate-notes)
+          fi
+
+          assets=(
+            "CapsSwitch-${GITHUB_REF_NAME}.zip"
+            "dist/CapsSwitch-x64.exe"
+            "dist/CapsSwitch-x86.exe"
+          )
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release 已存在，更新说明与附件（附件允许覆盖）"
+            # gh release edit 不支持 --generate-notes，只在有手写说明时更新正文。
+            if [ -f "$notes" ]; then
+              gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                "${notes_args[@]}"
+            fi
+            gh release upload "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+              --clobber "${assets[@]}"
+          else
+            # 除整包外，两个 exe 也单独挂上去，方便「下载即用」。
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "CapsSwitch ${GITHUB_REF_NAME}" \
+              "${notes_args[@]}" \
+              "${assets[@]}"
+          fi
