@@ -2,8 +2,14 @@
 // config.cpp - 配置持久化
 //
 // 包含两块彼此独立、但都归「记住用户设置」这件事管辖的逻辑：
-//   1. %APPDATA%\CapsSwitch\config.ini 的读写（Enabled / AutoStart / HotkeyMode）；
+//   1. %APPDATA%\CapsSwitch\config.ini 的读写
+//      （[General] Enabled / AutoStart / HotkeyMode，[Ignore] App1..AppN）；
 //   2. HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的开关机启动项。
+//
+// 忽略列表刻意用 [Ignore] App1..AppN 这种「一条一个键」的形式，而不是
+// 分号分隔的一整行 —— 用户手工编辑时不会因为多打一个分号把整张表毁掉，
+// 出问题也只需要删掉那一行。读取时按顺序扫到空键就跳过（允许中间有空洞），
+// 保存时把多余的键删掉，两边的状态因此始终一致。
 //
 // 设计原则：这一层永不弹窗、永不失败退出。配置读不到就用默认值，
 // 写不进就静默忽略——配置文件只决定「下次启动时的初始状态」，
@@ -75,6 +81,24 @@ static void JoinPathW(wchar_t* dst, int cch, const wchar_t* a, const wchar_t* b)
 static const wchar_t* const kAppDataSubDir = L"CapsSwitch";
 static const wchar_t* const kConfigFile   = L"config.ini";
 static const wchar_t* const kIniSection   = L"General";
+static const wchar_t* const kIgnoreSection = L"Ignore";
+
+/** 生成忽略列表的键名：1 -> "App1"，16 -> "App16"。 */
+static void MakeIgnoreKey(int oneBased, wchar_t* out, int cch)
+{
+    if (out == NULL || cch <= 0) {
+        return;
+    }
+
+    wchar_t digits[12];
+    IntToStrW(oneBased, digits);
+
+    lstrcpynW(out, L"App", cch);
+    const int used = lstrlenW(out);
+    if (used < cch - 1) {
+        lstrcpynW(out + used, digits, cch - used);
+    }
+}
 
 void Config_Default(AppConfig* cfg)
 {
@@ -84,6 +108,11 @@ void Config_Default(AppConfig* cfg)
     cfg->enabled    = TRUE;
     cfg->autoStart  = FALSE;
     cfg->hotkeyMode = HOTKEY_CTRL_SPACE;
+
+    cfg->ignoreCount = 0;
+    for (int i = 0; i < CAPS_MAX_IGNORE; ++i) {
+        cfg->ignoreApps[i][0] = L'\0';
+    }
 }
 
 BOOL Config_GetPath(wchar_t* out, int cch)
@@ -130,6 +159,47 @@ void Config_Load(AppConfig* cfg)
     if (cfg->hotkeyMode < 0 || cfg->hotkeyMode >= HOTKEY_MODE_COUNT) {
         cfg->hotkeyMode = HOTKEY_CTRL_SPACE;
     }
+
+    // ---- [Ignore] App1..AppN ----
+    // 读到空键就跳过，因此允许用户删掉中间某行而不影响后面的条目。
+    // 缓冲区给到 2 倍：万一有人写了超长的一整行路径，宁可整条丢弃，
+    // 也不要让 GetPrivateProfileString 把它截成另一个能匹配上的名字。
+    for (int i = 1; i <= CAPS_MAX_IGNORE; ++i) {
+        wchar_t key[16];
+        MakeIgnoreKey(i, key, ARRAYSIZE(key));
+
+        wchar_t raw[CAPS_IGNORE_NAME_LEN * 2];
+        raw[0] = L'\0';
+        GetPrivateProfileStringW(kIgnoreSection, key, L"", raw, ARRAYSIZE(raw), path);
+
+        if (raw[0] == L'\0') {
+            continue;
+        }
+
+        wchar_t norm[CAPS_IGNORE_NAME_LEN];
+        if (!Ignore_Normalize(raw, norm, ARRAYSIZE(norm))) {
+            continue;
+        }
+
+        if (cfg->ignoreCount >= CAPS_MAX_IGNORE) {
+            break;
+        }
+
+        // 去重：手工编辑时很容易把同一个程序写两遍。
+        BOOL duplicate = FALSE;
+        for (int j = 0; j < cfg->ignoreCount; ++j) {
+            if (lstrcmpiW(cfg->ignoreApps[j], norm) == 0) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+
+        lstrcpynW(cfg->ignoreApps[cfg->ignoreCount], norm, CAPS_IGNORE_NAME_LEN);
+        ++cfg->ignoreCount;
+    }
 }
 
 void Config_Save(const AppConfig* cfg)
@@ -149,6 +219,20 @@ void Config_Save(const AppConfig* cfg)
     WritePrivateProfileStringW(kIniSection, L"Enabled",   cfg->enabled   ? L"1" : L"0", path);
     WritePrivateProfileStringW(kIniSection, L"AutoStart", cfg->autoStart ? L"1" : L"0", path);
     WritePrivateProfileStringW(kIniSection, L"HotkeyMode", mode, path);
+
+    // ---- [Ignore] ----
+    // 有效条目按顺序写 App1..AppN，其余全部删除（传 NULL 即删除该键）。
+    // 这样「从列表里移除一条」才会真的从文件里消失，而不是留个空壳。
+    for (int i = 0; i < CAPS_MAX_IGNORE; ++i) {
+        wchar_t key[16];
+        MakeIgnoreKey(i + 1, key, ARRAYSIZE(key));
+
+        if (i < cfg->ignoreCount && cfg->ignoreApps[i][0] != L'\0') {
+            WritePrivateProfileStringW(kIgnoreSection, key, cfg->ignoreApps[i], path);
+        } else {
+            WritePrivateProfileStringW(kIgnoreSection, key, NULL, path);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

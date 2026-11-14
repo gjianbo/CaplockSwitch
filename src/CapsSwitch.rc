@@ -1,11 +1,26 @@
 // ---------------------------------------------------------------------------
 // CapsSwitch.rc - 资源脚本
 //
-// 只做两件事：把两个托盘图标和一份 manifest 嵌进 exe。
+// 三件事：把两个托盘图标、一份 manifest、一份版本信息嵌进 exe。
 // 路径相对于本文件所在目录（src/）。
+//
+// 改版本号时注意两处要同步：下面的 CAPS_VERSION_*，以及发布时打的 git tag
+// （tag 必须是 v 开头，CI 才会创建 Release）。
 // ---------------------------------------------------------------------------
 
 #include "resource.h"
+
+#define CAPS_VERSION_MAJOR  1
+#define CAPS_VERSION_MINOR  1
+#define CAPS_VERSION_PATCH  0
+#define CAPS_VERSION_BUILD  0
+
+// 版本块的几个取值常量（VOS_NT_WINDOWS32 / VFT_APP）定义在 winver.h 里，
+// 而 rc.exe 不一定能通过 INCLUDE 找到 SDK 头（本机 tools/build_local.sh
+// 直接调 rc，未设 SDK 的 include 目录就会报 RC1015）。这里直接用数值，
+// 既不依赖头文件搜索路径，也不会因为工具集换版而变化 —— 这几个值二十年没动过。
+#define CAPS_OS_NT_WINDOWS32  0x00040004L   /* VOS_NT | VOS__WINDOWS32 */
+#define CAPS_FILETYPE_APP     0x00000001L   /* VFT_APP */
 
 // ---- 图标 -----------------------------------------------------------------
 IDI_CAPSSWITCH_ON   ICON    "../icons/IDI_ON.ico"
@@ -15,3 +30,34 @@ IDI_CAPSSWITCH_OFF  ICON    "../icons/IDI_OFF.ico"
 // 1  = CREATEPROCESS_MANIFEST_RESOURCE_ID
 // 24 = RT_MANIFEST
 1                   24      "CapsSwitch.manifest"
+
+// ---- 版本信息 -------------------------------------------------------------
+// 全部使用 ASCII 字符串：rc.exe 的代码页选项在不同工具集里行为不一致，
+// 版本块里塞中文容易在 CI 上变成乱码，没必要冒这个风险。
+// 语言块 080404b0 = 简体中文 / Unicode，与 VarFileInfo 的 Translation 对应。
+1 VERSIONINFO
+FILEVERSION    CAPS_VERSION_MAJOR,CAPS_VERSION_MINOR,CAPS_VERSION_PATCH,CAPS_VERSION_BUILD
+PRODUCTVERSION CAPS_VERSION_MAJOR,CAPS_VERSION_MINOR,CAPS_VERSION_PATCH,CAPS_VERSION_BUILD
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         CAPS_OS_NT_WINDOWS32
+FILETYPE       CAPS_FILETYPE_APP
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription",  "Caps Lock to input method switch"
+            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "InternalName",     "CapsSwitch"
+            VALUE "OriginalFilename", "CapsSwitch.exe"
+            VALUE "ProductName",      "CapsSwitch"
+            VALUE "ProductVersion",   "1.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

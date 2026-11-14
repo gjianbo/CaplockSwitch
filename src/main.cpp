@@ -81,6 +81,8 @@ static void SaveState(void)
     cfg.enabled    = g_app.enabled;
     cfg.autoStart  = g_app.autoStart;
     cfg.hotkeyMode = g_app.hotkeyMode;
+    Ignore_WriteConfig(&cfg);   // [Ignore] 段与其余字段一起落盘
+
     Config_Save(&cfg);
 }
 
@@ -172,6 +174,18 @@ void App_SetAutoStart(BOOL enable, BOOL persist)
 void App_ToggleEnabled(void)
 {
     App_SetEnabled(!g_app.enabled, TRUE);
+}
+
+void App_SaveIgnoreList(void)
+{
+    SaveState();
+
+    // 让设置窗口立刻反映最新列表（含「取消」回滚后的状态）。
+    Settings_SyncFromState();
+
+    // 用户很可能就站在那个被忽略的程序窗口前改设置，立刻重判一次，
+    // 不要等到下一次切换前台才生效。
+    Ignore_Refresh();
 }
 
 void App_HandleCommand(int cmd)
@@ -351,6 +365,8 @@ static void Teardown(void)
 {
     Hook_Uninstall();          // 未安装时空操作
 
+    Ignore_UninstallWatcher(); // 未安装时空操作
+
     if (g_app.hWnd != NULL) {
         UnregisterHotKey(g_app.hWnd, IDH_TOGGLE);
     }
@@ -416,6 +432,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     Config_Load(&cfg);
     g_app.enabled    = cfg.enabled;
     g_app.hotkeyMode = cfg.hotkeyMode;
+    Ignore_ApplyConfig(&cfg);   // [Ignore] 忽略应用列表
 
     // 开机启动以注册表为准（config.ini 里的 AutoStart 只是记录）。
     g_app.autoStart = AutoStart_IsEnabled();
@@ -454,6 +471,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         CloseHandle(mutex);
         return SELFTEST_ERR_TRAY;
     }
+
+    // ---- 忽略应用：前台窗口变化监听 ----
+    // 只影响「要不要让路」，装不上也不算致命故障：钩子里还有一条
+    // 300ms 限频的兜底判定，功能会退化成略有延迟但依然可用。
+    // 因此这里不做自检断言。
+    Ignore_InstallWatcher();
+    Ignore_Refresh();
 
     // ---- 键盘钩子（常驻，与启用状态无关）----
     // 必须在整个进程生命周期内挂着：暂停状态下还要靠它识别 Ctrl+Caps，

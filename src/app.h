@@ -77,6 +77,21 @@
 #define CAPS_SIGNATURE         ((ULONG_PTR)0x43'53'57'31)   /* 'CSW1' */
 
 // ---------------------------------------------------------------------------
+// 忽略应用
+// ---------------------------------------------------------------------------
+
+/**
+ * 忽略列表的最大条目数。
+ *
+ * 上限存在的意义是让 AppState 保持定长、不需要堆分配，同时也顺带
+ * 挡住配置文件被写坏后撑爆内存。16 条对个人用户足够。
+ */
+#define CAPS_MAX_IGNORE        16
+
+/** 单个进程名的最大长度（含结尾 '\0'），只存文件名，不存完整路径。 */
+#define CAPS_IGNORE_NAME_LEN   64
+
+// ---------------------------------------------------------------------------
 // 命令行自检（--selftest）
 // ---------------------------------------------------------------------------
 
@@ -143,6 +158,11 @@ struct AppConfig {
     BOOL enabled;      // [General] Enabled    : 是否启用 Caps 替换
     BOOL autoStart;    // [General] AutoStart  : 是否开机自动启动
     int  hotkeyMode;   // [General] HotkeyMode : CapsHotkeyMode 取值 (0-3)
+
+    // [Ignore] App1..AppN：这些程序处于前台时完全不拦截按键。
+    // 只保存进程文件名（如 uu.exe），比较时不区分大小写。
+    int     ignoreCount;
+    wchar_t ignoreApps[CAPS_MAX_IGNORE][CAPS_IGNORE_NAME_LEN];
 };
 
 /** 把配置恢复为出厂默认值（启用 / 不开机启动 / Ctrl+Space）。 */
@@ -226,6 +246,31 @@ void Settings_SyncFromState(void);
 void Settings_Shutdown(void);
 
 // ---------------------------------------------------------------------------
+// 界面小工具（settings.cpp 实现，供各窗口共用）
+// ---------------------------------------------------------------------------
+
+/**
+ * 取系统界面字体（跟随「显示设置」里的字号与缩放）。
+ *
+ * 进程内惰性创建并共享，调用方**不要** DeleteObject —— 生命周期由
+ * Settings_Shutdown 统一管理。
+ */
+HFONT Ui_GetFont(void);
+
+/**
+ * 创建一个子控件并挂上界面字体。
+ *
+ * @param parent 父窗口。
+ * @param cls    窗口类名，例如 L"BUTTON" / L"STATIC" / L"LISTBOX"。
+ * @param text   初始文本，可为 NULL。
+ * @param style  除 WS_CHILD | WS_VISIBLE 之外的样式。
+ * @param id     控件 ID（作为 HMENU 传给 CreateWindowEx）。
+ * @return 控件句柄；失败返回 NULL。
+ */
+HWND Ui_MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text,
+                    DWORD style, int x, int y, int w, int h, int id);
+
+// ---------------------------------------------------------------------------
 // 应用状态
 // ---------------------------------------------------------------------------
 
@@ -243,6 +288,13 @@ struct AppState {
     BOOL autoStart;               // 当前是否开机启动
     int  hotkeyMode;              // 当前快捷键模式（CapsHotkeyMode）
     BOOL remoteSession;           // 是否运行在远程桌面会话中
+
+    // ---- 忽略应用 ----
+    int     ignoreCount;          // ignoreApps 的有效条目数
+    wchar_t ignoreApps[CAPS_MAX_IGNORE][CAPS_IGNORE_NAME_LEN];
+    BOOL    ignoreActive;         // 当前前台进程是否命中忽略列表（钩子只读这一位）
+    HWINEVENTHOOK hWinEvent;      // 前台窗口变化监听；安装失败时为 NULL
+    wchar_t lastForegroundApp[CAPS_IGNORE_NAME_LEN];  // 最近一个外部前台进程名
 };
 
 /** 全局唯一状态实例。 */
@@ -289,3 +341,107 @@ void App_SetHotkeyMode(int mode, BOOL persist);
  * 注册表写入失败时不改变内存状态，避免界面与实际不一致。
  */
 void App_SetAutoStart(BOOL enable, BOOL persist);
+
+/**
+ * 忽略列表被改动后统一收尾：落盘 -> 同步设置窗口 -> 立刻重判当前前台应用。
+ *
+ * 设置窗口的「添加 / 移除」按钮调用它。之所以要立刻重判，是因为用户很可能
+ * 就是站在那个被忽略的程序窗口前改的设置，等下一次切换前台才生效会显得没反应。
+ */
+void App_SaveIgnoreList(void);
+
+// ---------------------------------------------------------------------------
+// 忽略应用
+// ---------------------------------------------------------------------------
+//
+// 语义：**列表中的进程处于前台时，钩子对该进程下的 Caps 按键完全不干预** ——
+// 包括 Ctrl+Caps 在内，全部原样透传给系统，仿佛 CapsSwitch 没有运行。
+//
+// 典型场景：悠悠远程 / ToDesk 这类远程控制软件自己也要用 Caps Lock，
+// 而全局低级键盘钩子挂在所有程序之前，不主动让路就会把按键抢走。
+
+/**
+ * 取指定进程的可执行文件名（不含路径）。
+ *
+ * @param pid 进程 ID。
+ * @param out 输出缓冲区。
+ * @param cch 缓冲区容量。
+ * @return 取到非空文件名时返回 TRUE。
+ *
+ * 用 QueryFullProcessImageNameW 而不是 psapi 的 GetModuleFileNameEx，
+ * 后者需要 PROCESS_VM_READ 权限、对 64 位进程还可能失败；
+ * PROCESS_QUERY_LIMITED_INFORMATION 在 Win7 及以后都能拿到路径。
+ */
+BOOL Process_GetImageBaseName(DWORD pid, wchar_t* out, int cch);
+
+/**
+ * 把用户输入/配置文件里的名字规范化成可直接比较的进程名。
+ *
+ * 规则：去掉目录部分、去掉首尾空白、没有扩展名时补 .exe。
+ * 不做大小写转换 —— 比较一律走 lstrcmpiW，保留原始大小写更利于显示。
+ *
+ * @param in  原始字符串，可以是完整路径。
+ * @param out 输出缓冲区。
+ * @param cch 缓冲区容量。
+ * @return 规范化后非空时返回 TRUE。
+ */
+BOOL Ignore_Normalize(const wchar_t* in, wchar_t* out, int cch);
+
+/** 安装前台窗口变化监听（异步回调，不在键盘输入路径上）。返回是否成功。 */
+BOOL Ignore_InstallWatcher(void);
+
+/** 卸载前台窗口变化监听；未安装时无副作用。 */
+void Ignore_UninstallWatcher(void);
+
+/**
+ * 只重算 ignoreActive，不碰任何界面。
+ *
+ * 供键盘钩子的兜底路径调用（WinEvent 监听装不上时），
+ * 因此**绝对不能在内部调用 Tray_Refresh / Shell_NotifyIcon**。
+ */
+void Ignore_Recompute(void);
+
+/** 重算 ignoreActive，结果变化时顺带刷新托盘 tooltip（只能在消息循环线程调用）。 */
+void Ignore_Refresh(void);
+
+/** 把配置里的忽略列表灌进 g_app，并按当前前台重算一次。 */
+void Ignore_ApplyConfig(const AppConfig* cfg);
+
+/** 把 g_app 里的忽略列表写进配置结构（供落盘 / 快照使用）。 */
+void Ignore_WriteConfig(AppConfig* cfg);
+
+/** 条目数。 */
+int Ignore_Count(void);
+
+/** 取第 index 条的名字；越界返回 NULL。 */
+const wchar_t* Ignore_Get(int index);
+
+/** 追加一条（自动规范化、去重、受上限约束）。返回是否真的加入了。 */
+BOOL Ignore_Add(const wchar_t* name);
+
+/** 删除第 index 条。返回是否删除成功。 */
+BOOL Ignore_RemoveAt(int index);
+
+/** 清空列表。 */
+void Ignore_Clear(void);
+
+// ---------------------------------------------------------------------------
+// 应用选择器
+// ---------------------------------------------------------------------------
+
+/**
+ * 弹出「选择运行中的程序」窗口，让用户挑一个进程加入忽略列表。
+ *
+ * 之所以不采用「点击按钮后抓当前前台窗口」的做法：用户只要一动鼠标去点
+ * 设置窗口，前台就已经变成 CapsSwitch 自己了，抓到的永远是错误答案。
+ * 列出现有窗口让他挑是唯一不会抓错的交互。
+ *
+ * 最近一个外部前台进程会被预选中 —— 用户通常是「先切到目标程序，
+ * 再从托盘打开设置」，这样他只要连点两下确定。
+ *
+ * @param owner 父窗口，非模态期间会被禁用。
+ * @param out   选中项的输出缓冲区（进程文件名）。
+ * @param cch   缓冲区容量。
+ * @return 用户点了「确定」并选中一项时返回 TRUE；取消返回 FALSE。
+ */
+BOOL AppPicker_Pick(HWND owner, wchar_t* out, int cch);

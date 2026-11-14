@@ -13,6 +13,13 @@
 
 set -u
 
+# Git Bash / MSYS2 会把以 '/' 开头的参数当成 POSIX 路径自动转换，
+# 于是 cl / link / rc 的开关（/nologo、/c、/fo ...）会被改写成
+# "C:/Program Files/Git/nologo" 之类的路径，rc 直接报 RC1107「invalid usage」。
+# 本脚本里的路径全部是相对路径或 cygpath 转好的 Windows 路径，
+# 因此整体关掉参数自动转换是最省事也最安全的做法。
+export MSYS2_ARG_CONV_EXCL='*'
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${1:-std}"
 
@@ -58,7 +65,8 @@ build_arch() {
     /utf-8 /std:c++17 /W4 /WX-
     /I src "/Fo$(cygpath -w "$ROOT/$OBJDIR")\\"
   )
-  local SOURCES=(src/main.cpp src/config.cpp src/hook.cpp src/tray.cpp src/settings.cpp)
+  local SOURCES=(src/main.cpp src/config.cpp src/hook.cpp src/tray.cpp src/settings.cpp
+                 src/ignore.cpp src/apppicker.cpp)
   local LDFLAGS=(
     /nologo /SUBSYSTEM:WINDOWS "/ENTRY:$ENTRY"
     /LTCG /OPT:REF /OPT:ICF /MANIFEST:NO /DYNAMICBASE /NXCOMPAT

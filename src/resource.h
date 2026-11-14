@@ -28,3 +28,7 @@
 #define IDC_CANCEL               405
 #define IDC_LABEL_HOTKEY         406
 #define IDC_LABEL_TOGGLEHINT     407    // 纯说明文字，不接收通知
+#define IDC_LABEL_IGNORE         408    // 「忽略应用」说明文字
+#define IDC_IGNORE_LIST          409    // 忽略列表
+#define IDC_IGNORE_ADD           410    // 添加...
+#define IDC_IGNORE_REMOVE        411    // 移除

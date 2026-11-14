@@ -85,7 +85,7 @@ rem /O1 体积优先，/GL 链接期优化，/Gy+/Gw+/GF 消除冗余代码与�
 rem /GR- /EHs-c- 关 RTTI 与异常，/utf-8 让源码里的中文按 UTF-8 解析。
 set CFLAGS=/nologo /c /O1 /Os /GL /Gy /Gw /GF /GR- /EHs-c- /D_HAS_EXCEPTIONS=0 /DNDEBUG /DUNICODE /D_UNICODE /utf-8 /std:c++17 /W4 /WX- /I src /Fo%OBJ%\
 set CFLAGS_NOGL=/nologo /c /O1 /Os /Gy /Gw /GF /GR- /EHs-c- /D_HAS_EXCEPTIONS=0 /DNDEBUG /DUNICODE /D_UNICODE /utf-8 /std:c++17 /W4 /WX- /I src /Fo%OBJ%\
-set SOURCES=src\main.cpp src\config.cpp src\hook.cpp src\tray.cpp src\settings.cpp
+set SOURCES=src\main.cpp src\config.cpp src\hook.cpp src\tray.cpp src\settings.cpp src\ignore.cpp src\apppicker.cpp
 set LDFLAGS=/nologo /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /LTCG /OPT:REF /OPT:ICF /MANIFEST:NO /DYNAMICBASE /NXCOMPAT
 set LIBS=user32.lib kernel32.lib gdi32.lib advapi32.lib shell32.lib comctl32.lib
 

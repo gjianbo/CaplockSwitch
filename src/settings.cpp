@@ -2,7 +2,7 @@
 // settings.cpp - 设置窗口
 //
 // 用 CreateWindowEx 直接搭控件（不使用资源对话框模板），布局写死在
-// OnInit 里，窗口不可调整大小。
+// CreateControls 里，窗口不可调整大小。
 //
 // 关于「确定 / 取消」的语义：
 //   规格书里同时出现了「复选框实时生效」「下拉框选择后即时保存」和
@@ -11,6 +11,7 @@
 //     * 打开窗口时对配置拍一张快照，「取消」把快照写回去（满足
 //       「取消放弃未保存修改」——放弃的是本次会话内的改动）；
 //     * 「确定」只关闭窗口，不做额外回滚。
+//   忽略列表同样遵守这套规则，所以快照里也包含它。
 // ---------------------------------------------------------------------------
 
 #include "app.h"
@@ -20,12 +21,16 @@
 // 布局常量（客户区坐标，单位像素）
 // ---------------------------------------------------------------------------
 
-static const int kClientW = 300;
-static const int kClientH = 196;
+static const int kClientW = 380;
+static const int kClientH = 322;
 static const int kMargin  = 16;
 static const int kRowW    = kClientW - kMargin * 2;
 static const int kBtnW    = 76;
 static const int kBtnH    = 26;
+
+/** 忽略列表的宽度，右侧留给「添加 / 移除」两个按钮。 */
+static const int kIgnoreListW = 260;
+static const int kIgnoreBtnW  = 80;
 
 /** 下拉框 4 个可选项的显示文本，顺序必须与 CapsHotkeyMode 一致。 */
 static const wchar_t* const kHotkeyLabels[HOTKEY_MODE_COUNT] = {
@@ -44,16 +49,16 @@ static HFONT      g_uiFont          = NULL;
 static AppConfig  g_snapshot        = {};   // 打开窗口时的配置快照
 
 /** 各控件句柄，随窗口生命周期存活。 */
-static HWND g_hEnable = NULL;
-static HWND g_hHotkey = NULL;
-static HWND g_hAuto   = NULL;
+static HWND g_hEnable     = NULL;
+static HWND g_hHotkey     = NULL;
+static HWND g_hAuto       = NULL;
+static HWND g_hIgnoreList = NULL;
 
 // ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
 
-/** 取系统界面字体（跟随「显示设置」里的缩放与字号）。 */
-static HFONT GetUiFont(void)
+HFONT Ui_GetFont(void)
 {
     if (g_uiFont != NULL) {
         return g_uiFont;
@@ -81,18 +86,35 @@ static int ClampMode(int mode)
     return mode;
 }
 
-/** 创建子控件的公共部分，统一挂字体。 */
-static HWND MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text,
-                        DWORD style, int x, int y, int w, int h, int id)
+HWND Ui_MakeControl(HWND parent, const wchar_t* cls, const wchar_t* text,
+                    DWORD style, int x, int y, int w, int h, int id)
 {
     HWND ctl = CreateWindowExW(
         0, cls, text, WS_CHILD | WS_VISIBLE | style,
         x, y, w, h, parent, (HMENU)(INT_PTR)id, g_app.hInst, NULL);
 
     if (ctl != NULL) {
-        SendMessageW(ctl, WM_SETFONT, (WPARAM)GetUiFont(), TRUE);
+        SendMessageW(ctl, WM_SETFONT, (WPARAM)Ui_GetFont(), TRUE);
     }
     return ctl;
+}
+
+/** 按当前忽略列表重建列表框内容。 */
+static void ReloadIgnoreList(void)
+{
+    if (g_hIgnoreList == NULL) {
+        return;
+    }
+
+    SendMessageW(g_hIgnoreList, LB_RESETCONTENT, 0, 0);
+
+    const int count = Ignore_Count();
+    for (int i = 0; i < count; ++i) {
+        const wchar_t* name = Ignore_Get(i);
+        if (name != NULL && name[0] != L'\0') {
+            SendMessageW(g_hIgnoreList, LB_ADDSTRING, 0, (LPARAM)name);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,37 +126,56 @@ static void CreateControls(HWND hwnd)
 {
     const int yEnable = kMargin;
 
-    g_hEnable = MakeControl(hwnd, L"BUTTON", L"启用 Caps Lock → 输入法切换",
-                            BS_AUTOCHECKBOX | WS_TABSTOP,
-                            kMargin, yEnable, kRowW, 22, IDC_ENABLE);
+    g_hEnable = Ui_MakeControl(hwnd, L"BUTTON", L"启用 Caps Lock → 输入法切换",
+                               BS_AUTOCHECKBOX | WS_TABSTOP,
+                               kMargin, yEnable, kRowW, 22, IDC_ENABLE);
 
-    MakeControl(hwnd, L"STATIC", L"切换输入法快捷键：",
-                SS_LEFT,
-                kMargin, yEnable + 34, kRowW, 18, IDC_LABEL_HOTKEY);
+    Ui_MakeControl(hwnd, L"STATIC", L"切换输入法快捷键：",
+                   SS_LEFT,
+                   kMargin, yEnable + 34, kRowW, 18, IDC_LABEL_HOTKEY);
 
     // CBS_DROPDOWNLIST：只读下拉。创建时的 h 参数决定展开后的列表高度。
-    g_hHotkey = MakeControl(hwnd, L"COMBOBOX", NULL,
-                            CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
-                            kMargin, yEnable + 54, kRowW, 180, IDC_HOTKEY);
+    g_hHotkey = Ui_MakeControl(hwnd, L"COMBOBOX", NULL,
+                               CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
+                               kMargin, yEnable + 54, kRowW, 180, IDC_HOTKEY);
 
-    g_hAuto = MakeControl(hwnd, L"BUTTON", L"开机自动启动",
-                          BS_AUTOCHECKBOX | WS_TABSTOP,
-                          kMargin, yEnable + 92, kRowW, 22, IDC_AUTOSTART);
+    g_hAuto = Ui_MakeControl(hwnd, L"BUTTON", L"开机自动启动",
+                             BS_AUTOCHECKBOX | WS_TABSTOP,
+                             kMargin, yEnable + 88, kRowW, 22, IDC_AUTOSTART);
+
+    // ---- 忽略应用 ----
+    Ui_MakeControl(hwnd, L"STATIC", L"忽略应用（这些程序在前台时不拦截 Caps）：",
+                   SS_LEFT | SS_ENDELLIPSIS,
+                   kMargin, yEnable + 120, kRowW, 18, IDC_LABEL_IGNORE);
+
+    g_hIgnoreList = Ui_MakeControl(hwnd, L"LISTBOX", NULL,
+                                   LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL |
+                                   WS_TABSTOP | WS_BORDER,
+                                   kMargin, yEnable + 142, kIgnoreListW, 90, IDC_IGNORE_LIST);
+
+    const int xIgnoreBtn = kMargin + kIgnoreListW + 8;
+    Ui_MakeControl(hwnd, L"BUTTON", L"添加...",
+                   BS_PUSHBUTTON | WS_TABSTOP,
+                   xIgnoreBtn, yEnable + 142, kIgnoreBtnW, kBtnH, IDC_IGNORE_ADD);
+    // 与「添加」按钮留 8px 间隔，不能直接排在它下面 26 处 —— 会压住上一颗。
+    Ui_MakeControl(hwnd, L"BUTTON", L"移除",
+                   BS_PUSHBUTTON | WS_TABSTOP,
+                   xIgnoreBtn, yEnable + 176, kIgnoreBtnW, kBtnH, IDC_IGNORE_REMOVE);
 
     // Ctrl+Caps 是程序唯一的键盘切换通路，但它不在本窗口的选项里，
     // 用户容易不知道，所以在这里点一句。SS_ENDELLIPSIS 是兜底：
     // 万一系统字号变大导致文字超宽，宁可截断成省略号也不越界压到按钮。
-    MakeControl(hwnd, L"STATIC", L"提示：Ctrl + Caps Lock 可随时切换启用 / 暂停",
-                SS_LEFT | SS_ENDELLIPSIS,
-                kMargin, yEnable + 116, kRowW, 18, IDC_LABEL_TOGGLEHINT);
+    Ui_MakeControl(hwnd, L"STATIC", L"提示：Ctrl + Caps Lock 可随时切换启用 / 暂停",
+                   SS_LEFT | SS_ENDELLIPSIS,
+                   kMargin, yEnable + 240, kRowW, 18, IDC_LABEL_TOGGLEHINT);
 
     const int yBtn = kClientH - kMargin - kBtnH;
-    MakeControl(hwnd, L"BUTTON", L"确定",
-                BS_DEFPUSHBUTTON | WS_TABSTOP,
-                kClientW - kMargin - kBtnW * 2 - 8, yBtn, kBtnW, kBtnH, IDC_OK);
-    MakeControl(hwnd, L"BUTTON", L"取消",
-                BS_PUSHBUTTON | WS_TABSTOP,
-                kClientW - kMargin - kBtnW, yBtn, kBtnW, kBtnH, IDC_CANCEL);
+    Ui_MakeControl(hwnd, L"BUTTON", L"确定",
+                   BS_DEFPUSHBUTTON | WS_TABSTOP,
+                   kClientW - kMargin - kBtnW * 2 - 8, yBtn, kBtnW, kBtnH, IDC_OK);
+    Ui_MakeControl(hwnd, L"BUTTON", L"取消",
+                   BS_PUSHBUTTON | WS_TABSTOP,
+                   kClientW - kMargin - kBtnW, yBtn, kBtnW, kBtnH, IDC_CANCEL);
 
     // ---- 填充可选项 ----
     if (g_hHotkey != NULL) {
@@ -149,13 +190,14 @@ static void CreateControls(HWND hwnd)
     if (g_hHotkey != NULL) {
         SendMessageW(g_hHotkey, CB_SETCURSEL, (WPARAM)ClampMode(g_app.hotkeyMode), 0);
     }
+    ReloadIgnoreList();
 }
 
 // ---------------------------------------------------------------------------
 // 窗口过程
 // ---------------------------------------------------------------------------
 
-/** 处理子控件通知：勾选、下拉选择、按钮。 */
+/** 处理子控件通知：勾选、下拉选择、列表与按钮。 */
 static void OnCommand(HWND hwnd, int id, int code)
 {
     switch (id) {
@@ -177,15 +219,48 @@ static void OnCommand(HWND hwnd, int id, int code)
         }
         break;
 
+    case IDC_IGNORE_ADD: {
+        wchar_t name[CAPS_IGNORE_NAME_LEN];
+        if (AppPicker_Pick(hwnd, name, ARRAYSIZE(name))) {
+            if (!Ignore_Add(name)) {
+                MessageBoxW(hwnd,
+                            L"没能加入忽略列表。\n\n"
+                            L"可能是列表已满（最多 16 条），或名称无效。",
+                            CAPS_APP_NAME, MB_OK | MB_ICONINFORMATION);
+            }
+            App_SaveIgnoreList();
+        }
+        break;
+    }
+
+    case IDC_IGNORE_REMOVE: {
+        if (g_hIgnoreList == NULL) {
+            break;
+        }
+        const int sel = (int)SendMessageW(g_hIgnoreList, LB_GETCURSEL, 0, 0);
+        if (sel == LB_ERR) {
+            MessageBoxW(hwnd, L"请先在列表里选中要移除的程序。",
+                        CAPS_APP_NAME, MB_OK | MB_ICONINFORMATION);
+            break;
+        }
+        if (Ignore_RemoveAt(sel)) {
+            App_SaveIgnoreList();
+        }
+        break;
+    }
+
     case IDC_OK:
         DestroyWindow(hwnd);
         break;
 
     case IDC_CANCEL:
         // 回滚到打开窗口那一刻的状态，并把回滚结果落盘。
+        // 忽略列表也要回滚，否则「取消」对它形同虚设。
+        Ignore_ApplyConfig(&g_snapshot);
         App_SetEnabled(g_snapshot.enabled, TRUE);
         App_SetHotkeyMode(g_snapshot.hotkeyMode, TRUE);
         App_SetAutoStart(g_snapshot.autoStart, TRUE);
+        App_SaveIgnoreList();
         DestroyWindow(hwnd);
         break;
 
@@ -220,9 +295,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
     case WM_DESTROY:
         g_app.hSettings = NULL;
-        g_hEnable = NULL;
-        g_hHotkey = NULL;
-        g_hAuto   = NULL;
+        g_hEnable     = NULL;
+        g_hHotkey     = NULL;
+        g_hAuto       = NULL;
+        g_hIgnoreList = NULL;
         return 0;
 
     default:
@@ -272,10 +348,11 @@ void Settings_Open(HWND owner)
         return;
     }
 
-    // 拍快照，供「取消」回滚。
+    // 拍快照，供「取消」回滚。忽略列表也一并记录。
     g_snapshot.enabled    = g_app.enabled;
     g_snapshot.autoStart  = g_app.autoStart;
     g_snapshot.hotkeyMode = g_app.hotkeyMode;
+    Ignore_WriteConfig(&g_snapshot);
 
     const DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     const DWORD exStyle = WS_EX_CONTROLPARENT;   // 让 IsDialogMessage 支持 Tab 遍历
@@ -315,6 +392,8 @@ void Settings_SyncFromState(void)
     if (g_hHotkey != NULL) {
         SendMessageW(g_hHotkey, CB_SETCURSEL, (WPARAM)ClampMode(g_app.hotkeyMode), 0);
     }
+
+    ReloadIgnoreList();
 }
 
 void Settings_Shutdown(void)

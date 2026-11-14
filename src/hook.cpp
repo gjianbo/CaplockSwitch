@@ -5,6 +5,9 @@
 //
 // 决策表（仅对本机物理键盘动作生效）：
 //
+//   （前台是忽略列表里的程序）
+//   Caps 相关的一切  -> 全部原样透传，包括 Ctrl+Caps
+//
 //   Shift + Caps     -> 放行，系统执行原生 Caps Lock 大写切换
 //   Ctrl  + Caps     -> 吞掉，并发出一条「切换启用 / 暂停」请求
 //                       （启用、暂停两种状态下都生效，是唯一的键盘唤入口）
@@ -13,6 +16,10 @@
 //   单独按 Caps      -> 吞掉，并发出一条配置好的输入法切换快捷键
 //   （暂停状态）
 //   单独按 Caps      -> 原样透传，系统原生大写锁定
+//
+// 「忽略列表」是唯一排在所有规则之前的例外：一旦命中，钩子对这个进程下的
+// Caps 完全不表态，连 Ctrl+Caps 也不识别 —— 否则远程控制软件那类自己要用
+// Caps 的程序就永远抢不到这个键。
 //
 // 两条防回环措施缺一不可：
 //   1. 注入按键带 CAPS_SIGNATURE 签名，见到即放行（识别「自己」）；
@@ -41,6 +48,40 @@
  * 共用它 —— 同一次按下只可能走其中一个分支，且 KEYUP 必定复位。
  */
 static BOOL g_capsHeld = FALSE;
+
+/**
+ * 兜底判定路径的上次执行时刻（毫秒）。
+ *
+ * 正常情况下前台变化由 SetWinEventHook 异步通知，这里用不到；
+ * 只有当那个监听装不上时才会走限频重算，避免在输入路径上反复开进程。
+ */
+static DWORD g_ignoreCheckedAt = 0;
+
+/**
+ * 当前前台应用是否在忽略列表中（命中则应把按键完全交还给系统）。
+ *
+ * 热路径上只读 g_app.ignoreActive 一个 BOOL：正常情况它由前台变化回调
+ * 在消息循环里更新，这里不做任何进程查询。
+ */
+static BOOL IsIgnoredForeground(void)
+{
+    if (g_app.ignoreCount <= 0) {
+        return FALSE;
+    }
+
+    // WinEvent 监听不可用时的兜底：限频 300ms 重算。
+    // 注意只调 Ignore_Recompute()，它不碰托盘、不碰界面 ——
+    // 钩子回调跑在系统输入处理路径上，这里不能做任何会阻塞的事。
+    if (g_app.hWinEvent == NULL) {
+        const DWORD now = GetTickCount();
+        if (now - g_ignoreCheckedAt >= 300) {
+            g_ignoreCheckedAt = now;
+            Ignore_Recompute();
+        }
+    }
+
+    return g_app.ignoreActive;
+}
 
 // ---------------------------------------------------------------------------
 // 按键序列
@@ -187,6 +228,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     const BOOL isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
     const BOOL isUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
     if (!isDown && !isUp) {
+        return CallNextHookEx(g_app.hHook, nCode, wParam, lParam);
+    }
+
+    // ---- 忽略应用：命中时完全不表态 ----------------------------------------
+    // 必须排在 Shift / Ctrl / 暂停透传之前，否则「忽略」就只是部分忽略。
+    // 放在 vkCode 判断之后也是刻意的：普通按键不会为它付出任何查询成本。
+    if (IsIgnoredForeground()) {
+        g_capsHeld = FALSE;
         return CallNextHookEx(g_app.hHook, nCode, wParam, lParam);
     }
 
