@@ -6,18 +6,20 @@
 // 语义：**列表中的程序处于前台时，本程序对 Caps 完全不干预**，包括
 // Ctrl+Caps —— 全部原样透传，仿佛 CapsSwitch 没有运行。
 //
-// 性能约束（重要）：
-// 判定结果缓存成 g_app.ignoreActive 一个 BOOL，键盘钩子回调里**只读这一位**。
-// 真正的进程查询只发生在两个地方，都不在输入路径上：
-//   1. SetWinEventHook 的前台变化回调只记一个 PID，然后投递
-//      CAPS_WM_FOREGROUND；窗口过程收到后才做 Ignore_Refresh()
-//      （进程名解析 + 忽略判定 + 托盘刷新）。
-//   2. 钩子里的兜底分支 —— 仅当第 1 条安装失败时才启用，限频 300ms，
-//      且同样只投递消息，连进程名解析都不做。
-//   3. 用户点「添加...」时，应用选择器按 PID 现查一次名字用于预选。
+// 性能约束（最重要的一条）：
+// **运行时绝不做任何进程名解析**。判定结果缓存成 g_app.ignoreActive 一个
+// BOOL，键盘钩子回调只读这一位；前台变化回调只记一个 PID（O(1)）。
 //
-// 之所以这么绕：前台变化回调与低级键盘钩子共用安装线程的消息循环，
-// 在那里 OpenProcess / 遍历 Toolhelp 快照会连键盘事件派发一起拖慢。
+// 会碰 OpenProcess / Toolhelp 快照的地方只有三处，全都不在输入路径上：
+//   1. Ignore_RebuildPidSet()：启动、用户改忽略列表、低频 WM_TIMER 时，
+//      一次快照把所有命中规则的进程 PID 收进整数集合；
+//   2. 用户点「添加...」时，应用选择器枚举窗口现查一次名字；
+//   3. 选择器预选时按 lastForegroundPid 现查一次名字。
+//
+// 为什么这么改：旧实现每次前台变化都要解析前台进程名（OpenProcess，
+// 失败则全量 Toolhelp 快照），而解析失败的 PID 不入缓存，会反复重来。
+// 截图时前台在「被忽略程序 <-> 截图工具 <-> 目标程序」之间高频切换，
+// 这些开销全压在承载低级键盘钩子的消息循环上，把 Ctrl+V 事件拖掉。
 //
 // 本文件同样遵守「不依赖 CRT」的约定：只用 lstr* 系列，不用 wcscmp/swprintf。
 // ---------------------------------------------------------------------------
@@ -26,16 +28,18 @@
 #include <tlhelp32.h>   // CreateToolhelp32Snapshot：取进程名的兜底通道
 
 // ---------------------------------------------------------------------------
-// 前台进程名缓存（放在文件前部，Ignore_Clear 也要用）
+// 忽略进程的 PID 集合（放在文件前部，Ignore_Clear 也要用）
 // ---------------------------------------------------------------------------
 
 /**
- * 前台变化是高频事件（截图工具弹工具条、切换窗口都会触发），但同一个
- * 进程的名字不会变。按 PID 缓存后，OpenProcess / Toolhelp 快照每个进程
- * 最多走一次；同进程内反复切换前台只剩一次字符串比较。
+ * 运行时判定只靠这张整数表，绝不解析进程名。
+ * 一个程序可能有多个进程，容量按规则数放大几倍；满了就停止收录，
+ * 属极端情况，宁可少忽略几个也不能让表越界。
  */
-static DWORD   g_cachedPid  = 0;
-static wchar_t g_cachedName[CAPS_IGNORE_NAME_LEN] = L"";
+#define CAPS_MAX_IGNORED_PIDS  (CAPS_MAX_IGNORE * 4)
+
+static DWORD g_ignoredPids[CAPS_MAX_IGNORED_PIDS];
+static int   g_ignoredPidCount = 0;
 
 // ---------------------------------------------------------------------------
 // 进程名查询
@@ -252,46 +256,67 @@ void Ignore_Clear(void)
     }
     g_app.ignoreCount  = 0;
     g_app.ignoreActive = FALSE;
-    g_cachedPid        = 0;
-    g_cachedName[0]    = L'\0';
+    g_ignoredPidCount  = 0;
 }
 
 // ---------------------------------------------------------------------------
 // 判定
 // ---------------------------------------------------------------------------
 
+void Ignore_RebuildPidSet(void)
+{
+    g_ignoredPidCount = 0;
+
+    if (g_app.ignoreCount <= 0) {
+        g_app.ignoreActive = FALSE;
+        return;
+    }
+
+    // TH32CS_SNAPPROCESS 不需要 OpenProcess，提权/受保护进程照样能列出。
+    // szExeFile 本来就是文件名，与配置里的 uu.exe 格式一致，直接比较。
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    PROCESSENTRY32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            BOOL matched = FALSE;
+            for (int i = 0; i < g_app.ignoreCount; ++i) {
+                if (lstrcmpiW(pe.szExeFile, g_app.ignoreApps[i]) == 0) {
+                    matched = TRUE;
+                    break;
+                }
+            }
+            if (matched && g_ignoredPidCount < CAPS_MAX_IGNORED_PIDS) {
+                g_ignoredPids[g_ignoredPidCount++] = pe.th32ProcessID;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+}
+
 void Ignore_Recompute(void)
 {
     BOOL active = FALSE;
 
-    if (g_app.ignoreCount > 0) {
+    // 纯内存：一次 GetForegroundWindow + 一次 PID 线性查找。
+    // 没有 OpenProcess、没有 Toolhelp、没有字符串比较、没有托盘刷新。
+    if (g_ignoredPidCount > 0) {
         HWND fg = GetForegroundWindow();
         if (fg != NULL) {
             DWORD pid = 0;
             GetWindowThreadProcessId(fg, &pid);
-
             if (pid != 0) {
-                if (pid != g_cachedPid) {
-                    wchar_t name[CAPS_IGNORE_NAME_LEN];
-                    name[0] = L'\0';
-                    if (Process_GetImageBaseName(pid, name, ARRAYSIZE(name))) {
-                        lstrcpynW(g_cachedName, name, ARRAYSIZE(g_cachedName));
-                        g_cachedPid = pid;
-                    } else {
-                        // 查不到就不缓存 PID，下次还有机会重试。
-                        g_cachedPid = 0;
-                        g_cachedName[0] = L'\0';
-                    }
-                }
-
-                if (g_cachedName[0] != L'\0') {
-                    for (int i = 0; i < g_app.ignoreCount; ++i) {
-                        // 大小写不敏感：Windows 文件名本来就不区分大小写，
-                        // 用户在 ini 里写成 UU.EXE 也该生效。
-                        if (lstrcmpiW(g_cachedName, g_app.ignoreApps[i]) == 0) {
-                            active = TRUE;
-                            break;
-                        }
+                for (int i = 0; i < g_ignoredPidCount; ++i) {
+                    if (g_ignoredPids[i] == pid) {
+                        active = TRUE;
+                        break;
                     }
                 }
             }
@@ -301,16 +326,14 @@ void Ignore_Recompute(void)
     g_app.ignoreActive = active;
 }
 
-void Ignore_Refresh(void)
-{
-    const BOOL before = g_app.ignoreActive;
-    Ignore_Recompute();
-
-    // 只在状态翻转时刷新托盘，避免每次前台变化都做一次 Shell_NotifyIcon。
-    if (before != g_app.ignoreActive) {
-        Tray_Refresh();
-    }
-}
+// 注意：**这里刻意不刷新托盘**。
+// 曾经有个 Ignore_Refresh() 在 ignoreActive 翻转时调 Tray_Refresh() ->
+// Shell_NotifyIconW(NIM_MODIFY)。但托盘图标和 tooltip 都只取决于
+// enabled / remoteSession，压根不看 ignoreActive，那次刷新没有任何可见效果；
+// 而 Shell_NotifyIconW 是同步跨进程调用，又发生在承载键盘钩子的消息循环
+// 线程上。前台在「忽略应用 <-> 截图工具 <-> 目标程序」之间来回切换时，
+// 状态反复翻转就会反复同步等 Explorer，把全局按键派发一起拖住 ——
+// 表现为从被忽略进程截图后 Ctrl+V 粘不出图片。纯属有害无益，已移除。
 
 void Ignore_ApplyConfig(const AppConfig* cfg)
 {
@@ -333,6 +356,8 @@ void Ignore_ApplyConfig(const AppConfig* cfg)
         }
     }
 
+    // 启动时扫一次进程表，之后运行时只做 PID 整数比较。
+    Ignore_RebuildPidSet();
     Ignore_Recompute();
 }
 
@@ -365,8 +390,9 @@ void Ignore_WriteConfig(AppConfig* cfg)
  * Shell_NotifyIcon）都会把钩子回调的派发一起拖慢，表现为全局按键偶发
  * 延迟；剪贴板图片的延迟渲染对这种时序尤其敏感。
  *
- * 因此本回调只做两件 O(1) 的事：记下前台进程 PID、投递一条消息。
- * 进程名解析留给应用选择器按需执行，忽略判定与托盘刷新留给窗口过程。
+ * 因此本回调**只做一件事**：记下前台进程 PID。
+ * 不投递消息、不查进程名、不刷托盘 —— 忽略判定由低频 WM_TIMER 驱动，
+ * 前台变化再频繁也不会往消息队列里堆积工作。
  *
  * @param idObject / idChild 只处理「窗口对象本身」的事件，忽略子元素。
  */
@@ -395,10 +421,8 @@ static void CALLBACK OnForegroundEvent(HWINEVENTHOOK hook, DWORD event, HWND hwn
     if (pid != GetCurrentProcessId()) {
         g_app.lastForegroundPid = pid;
     }
-
-    if (g_app.hWnd != NULL) {
-        PostMessageW(g_app.hWnd, CAPS_WM_FOREGROUND, 0, 0);
-    }
+    // 刻意不 PostMessage：ignoreActive 由 WM_TIMER 低频刷新，
+    // 前台变化回调保持 O(1)，不往键盘钩子所在的消息队列里塞任何东西。
 }
 
 BOOL Ignore_InstallWatcher(void)

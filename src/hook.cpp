@@ -27,8 +27,9 @@
 //      保证程序只对物理键盘动作做决策。
 //
 // 回调里**不做任何实际工作**：切换启用状态投递 CAPS_WM_TOGGLE，
-// 发送输入法快捷键投递 CAPS_WM_SWITCH_HOTKEY，重判前台应用投递
-// CAPS_WM_FOREGROUND，全部由宿主窗口在正常消息循环里执行。
+// 发送输入法快捷键投递 CAPS_WM_SWITCH_HOTKEY，全部由宿主窗口在正常
+// 消息循环里执行。忽略判定连消息都不投递 —— 它由低频 WM_TIMER 刷新，
+// 回调只读一个 BOOL。
 // 尤其不能在回调里 SendInput —— 重入加上修饰键 KEYUP 可能被输入法吞掉，
 // 会让 Ctrl 卡在按下态，进而影响 Ctrl+V / Ctrl+C 这类组合键。
 //
@@ -56,40 +57,15 @@
 static BOOL g_capsHeld = FALSE;
 
 /**
- * 兜底判定路径的上次执行时刻（毫秒）。
- *
- * 正常情况下前台变化由 SetWinEventHook 异步通知，这里用不到；
- * 只有当那个监听装不上时才会走限频重算，避免在输入路径上反复开进程。
- */
-static DWORD g_ignoreCheckedAt = 0;
-
-/**
  * 当前前台应用是否在忽略列表中（命中则应把按键完全交还给系统）。
  *
- * 热路径上只读 g_app.ignoreActive 一个 BOOL：正常情况它由前台变化回调
- * 投递消息后在消息循环里更新，这里不做任何进程查询。
+ * **纯读一个 BOOL**：ignoreActive 由低频 WM_TIMER 在消息循环里刷新。
+ * 钩子回调里不做任何查询、不投递消息、不碰进程 API ——
+ * 前台变化再频繁，输入路径上的开销也恒定为一次内存读取。
  */
 static BOOL IsIgnoredForeground(void)
 {
-    if (g_app.ignoreCount <= 0) {
-        return FALSE;
-    }
-
-    // WinEvent 监听不可用时的兜底：限频 300ms 请求一次重算。
-    // 注意连 Ignore_Recompute() 都不在这里调 —— 它内部要 OpenProcess，
-    // 而钩子回调跑在系统输入处理路径上，任何进程查询都会拖慢全局按键。
-    // 只投递消息，让宿主窗口在消息循环里完成重算。
-    if (g_app.hWinEvent == NULL) {
-        const DWORD now = GetTickCount();
-        if (now - g_ignoreCheckedAt >= 300) {
-            g_ignoreCheckedAt = now;
-            if (g_app.hWnd != NULL) {
-                PostMessageW(g_app.hWnd, CAPS_WM_FOREGROUND, 0, 0);
-            }
-        }
-    }
-
-    return g_app.ignoreActive;
+    return (g_app.ignoreCount > 0) && g_app.ignoreActive;
 }
 
 // ---------------------------------------------------------------------------

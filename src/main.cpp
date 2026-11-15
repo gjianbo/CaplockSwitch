@@ -183,9 +183,10 @@ void App_SaveIgnoreList(void)
     // 让设置窗口立刻反映最新列表（含「取消」回滚后的状态）。
     Settings_SyncFromState();
 
-    // 用户很可能就站在那个被忽略的程序窗口前改设置，立刻重判一次，
-    // 不要等到下一次切换前台才生效。
-    Ignore_Refresh();
+    // 用户很可能就站在那个被忽略的程序窗口前改设置，立刻重扫 + 重判一次，
+    // 不要等到下一次定时器才生效。
+    Ignore_RebuildPidSet();
+    Ignore_Recompute();
 }
 
 void App_HandleCommand(int cmd)
@@ -251,12 +252,19 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         Hook_SendSwitchHotkey((HWND)wParam);
         return 0;
 
-    case CAPS_WM_FOREGROUND:
-        // 前台变化通知。进程名查询、忽略判定、托盘刷新统一在这里做，
-        // WinEvent 回调本身只记 PID + 投递消息，保持 O(1)。
-        // 没配置任何忽略应用时 Ignore_Recompute() 会立即返回，零开销。
-        Ignore_Refresh();
-        return 0;
+    case WM_TIMER:
+        if (wParam == CAPS_IGNORE_TIMER_ID) {
+            // WM_TIMER 是消息队列里优先级最低的，系统只在没有输入消息时
+            // 才生成它，因此不会挤占键盘钩子回调的派发。
+            static int s_ignoreTicks = 0;
+            if (++s_ignoreTicks >= 10) {
+                s_ignoreTicks = 0;
+                Ignore_RebuildPidSet();   // 约每 5 秒扫一次，覆盖后启动的进程
+            }
+            Ignore_Recompute();           // 纯 PID 整数查找，零进程 API
+            return 0;
+        }
+        break;
 
     case WM_HOTKEY:
         if ((int)wParam == IDH_TOGGLE) {
@@ -383,6 +391,7 @@ static void Teardown(void)
 
     if (g_app.hWnd != NULL) {
         UnregisterHotKey(g_app.hWnd, IDH_TOGGLE);
+        KillTimer(g_app.hWnd, CAPS_IGNORE_TIMER_ID);
     }
 
     Tray_Remove();             // 未挂载时空操作
@@ -486,12 +495,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         return SELFTEST_ERR_TRAY;
     }
 
-    // ---- 忽略应用：前台窗口变化监听 ----
-    // 只影响「要不要让路」，装不上也不算致命故障：钩子里还有一条
-    // 300ms 限频的兜底判定，功能会退化成略有延迟但依然可用。
-    // 因此这里不做自检断言。
+    // ---- 忽略应用：一次性进程扫描 + 低频刷新 ----
+    // 进程名解析只发生在启动、用户改配置、以及约每 5 秒一次的 WM_TIMER 里，
+    // 全都不在输入路径上。前台变化回调只记一个 PID，键盘钩子只读一个 BOOL。
+    // WinEvent 监听装不上也不算故障：定时器照样维护 ignoreActive。
     Ignore_InstallWatcher();
-    Ignore_Refresh();
+    Ignore_RebuildPidSet();
+    Ignore_Recompute();
+    SetTimer(g_app.hWnd, CAPS_IGNORE_TIMER_ID, 500, NULL);
 
     // ---- 键盘钩子（常驻，与启用状态无关）----
     // 必须在整个进程生命周期内挂着：暂停状态下还要靠它识别 Ctrl+Caps，

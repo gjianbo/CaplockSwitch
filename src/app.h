@@ -75,15 +75,13 @@
 #define CAPS_WM_SWITCH_HOTKEY  (WM_APP + 3)
 
 /**
- * 「前台窗口变了」通知（WinEvent 回调 -> 消息宿主窗口）。
+ * 忽略判定的低频刷新定时器 ID。
  *
- * SetWinEventHook 的回调与低级键盘钩子共用安装线程的消息循环，
- * 在那里做 OpenProcess / Toolhelp 快照会连钩子回调一起拖住。
- * 所以回调只记一个 PID 并投递本消息，真正的进程查询与托盘刷新
- * 交给窗口过程；窗口过程也不在输入路径上，且只在确实配了忽略
- * 应用时才会查询。
+ * 用 WM_TIMER 而不是「前台变化消息」驱动判定：WM_TIMER 是消息队列里
+ * 优先级最低的消息，系统只在队列中没有输入消息时才生成它，因此不会
+ * 挤占低级键盘钩子回调的派发。前台变化回调本身只记一个 PID。
  */
-#define CAPS_WM_FOREGROUND     (WM_APP + 4)
+#define CAPS_IGNORE_TIMER_ID   1
 
 /** 托盘图标在本进程内的唯一 ID。 */
 #define CAPS_TRAY_UID          1
@@ -432,15 +430,25 @@ BOOL Ignore_InstallWatcher(void);
 void Ignore_UninstallWatcher(void);
 
 /**
- * 只重算 ignoreActive，不碰任何界面。
+ * 重扫一次系统进程，把所有「名字命中忽略列表」的进程 PID 收进内部集合。
  *
- * 供键盘钩子的兜底路径调用（WinEvent 监听装不上时），
- * 因此**绝对不能在内部调用 Tray_Refresh / Shell_NotifyIcon**。
+ * 这是**唯一**会调用 OpenProcess / Toolhelp 快照的地方，只在启动、
+ * 用户修改忽略列表、以及低频定时器里执行 —— 都不在键盘输入路径上。
+ * 运行时判定完全靠 PID 整数比较，不碰任何进程 API。
+ *
+ * 需要重扫的原因：进程可能是在程序启动之后才运行的，PID 那时还不存在。
+ */
+void Ignore_RebuildPidSet(void);
+
+/**
+ * 重算 ignoreActive，只做一次 PID 整数查找，**不碰进程 API、不碰界面**。
+ *
+ * 由 WM_TIMER 驱动，也会在启动、保存忽略列表等场合直接调用。
+ * 绝对不能在这里调用 Tray_Refresh / Shell_NotifyIcon：托盘图标与 tooltip
+ * 都不依赖 ignoreActive，那次刷新没有可见效果，却是同步跨进程调用，
+ * 会拖住同一线程里的键盘钩子派发。
  */
 void Ignore_Recompute(void);
-
-/** 重算 ignoreActive，结果变化时顺带刷新托盘 tooltip（只能在消息循环线程调用）。 */
-void Ignore_Refresh(void);
 
 /** 把配置里的忽略列表灌进 g_app，并按当前前台重算一次。 */
 void Ignore_ApplyConfig(const AppConfig* cfg);
