@@ -23,10 +23,23 @@ export MSYS2_ARG_CONV_EXCL='*'
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${1:-std}"
 
-MSVC_VER="${MSVC_VER:-14.51.36231}"
 MSVC_ROOT="${MSVC_ROOT:-/f/visual_studio/18/Community/VC/Tools/MSVC}"
 SDK_ROOT="${SDK_ROOT:-/f/Windows Kits/10}"
 SDK_VER="${SDK_VER:-10.0.26100.0}"
+
+# VS 会自动升级工具集小版本（本机就从 14.51.36231 升到了 14.52.37025），
+# 硬编码版本号会在升级后毫无征兆地报 "cl: command not found"。
+# 默认取目录下版本号最大的一套，仍允许用 MSVC_VER 环境变量显式指定。
+if [ -z "${MSVC_VER:-}" ]; then
+  MSVC_VER="$(ls -1 "$MSVC_ROOT" 2>/dev/null \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n 1)"
+fi
+if [ -z "$MSVC_VER" ] || [ ! -x "$MSVC_ROOT/$MSVC_VER/bin/Hostx64/x64/cl.exe" ]; then
+  echo "未找到可用的 MSVC 工具集（$MSVC_ROOT），可用 MSVC_VER 显式指定。" >&2
+  exit 1
+fi
+echo "使用 MSVC 工具集：$MSVC_VER"
 MSVC="$MSVC_ROOT/$MSVC_VER"
 
 cd "$ROOT" || exit 1

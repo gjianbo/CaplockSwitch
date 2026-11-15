@@ -12,7 +12,7 @@
 
 #define CAPS_VERSION_MAJOR  1
 #define CAPS_VERSION_MINOR  1
-#define CAPS_VERSION_PATCH  0
+#define CAPS_VERSION_PATCH  1
 #define CAPS_VERSION_BUILD  0
 
 // 版本块的几个取值常量（VOS_NT_WINDOWS32 / VFT_APP）定义在 winver.h 里，
@@ -49,11 +49,11 @@ BEGIN
         BLOCK "080404b0"
         BEGIN
             VALUE "FileDescription",  "Caps Lock to input method switch"
-            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "FileVersion",      "1.1.1.0"
             VALUE "InternalName",     "CapsSwitch"
             VALUE "OriginalFilename", "CapsSwitch.exe"
             VALUE "ProductName",      "CapsSwitch"
-            VALUE "ProductVersion",   "1.1.0"
+            VALUE "ProductVersion",   "1.1.1"
         END
     END
     BLOCK "VarFileInfo"

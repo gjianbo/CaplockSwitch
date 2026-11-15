@@ -8,17 +8,34 @@
 //
 // 性能约束（重要）：
 // 判定结果缓存成 g_app.ignoreActive 一个 BOOL，键盘钩子回调里**只读这一位**。
-// 真正的进程查询发生在两个地方，都不在输入路径上：
-//   1. SetWinEventHook 的前台变化回调（WINEVENT_OUTOFCONTEXT，投递到本线程
-//      的消息队列，由消息循环派发）；
-//   2. 钩子里的兜底分支 —— 仅当第 1 条安装失败时才启用，且限频 300ms，
-//      并且只调 Ignore_Recompute()（不碰托盘、不碰界面）。
+// 真正的进程查询只发生在两个地方，都不在输入路径上：
+//   1. SetWinEventHook 的前台变化回调只记一个 PID，然后投递
+//      CAPS_WM_FOREGROUND；窗口过程收到后才做 Ignore_Refresh()
+//      （进程名解析 + 忽略判定 + 托盘刷新）。
+//   2. 钩子里的兜底分支 —— 仅当第 1 条安装失败时才启用，限频 300ms，
+//      且同样只投递消息，连进程名解析都不做。
+//   3. 用户点「添加...」时，应用选择器按 PID 现查一次名字用于预选。
+//
+// 之所以这么绕：前台变化回调与低级键盘钩子共用安装线程的消息循环，
+// 在那里 OpenProcess / 遍历 Toolhelp 快照会连键盘事件派发一起拖慢。
 //
 // 本文件同样遵守「不依赖 CRT」的约定：只用 lstr* 系列，不用 wcscmp/swprintf。
 // ---------------------------------------------------------------------------
 
 #include "app.h"
 #include <tlhelp32.h>   // CreateToolhelp32Snapshot：取进程名的兜底通道
+
+// ---------------------------------------------------------------------------
+// 前台进程名缓存（放在文件前部，Ignore_Clear 也要用）
+// ---------------------------------------------------------------------------
+
+/**
+ * 前台变化是高频事件（截图工具弹工具条、切换窗口都会触发），但同一个
+ * 进程的名字不会变。按 PID 缓存后，OpenProcess / Toolhelp 快照每个进程
+ * 最多走一次；同进程内反复切换前台只剩一次字符串比较。
+ */
+static DWORD   g_cachedPid  = 0;
+static wchar_t g_cachedName[CAPS_IGNORE_NAME_LEN] = L"";
 
 // ---------------------------------------------------------------------------
 // 进程名查询
@@ -235,6 +252,8 @@ void Ignore_Clear(void)
     }
     g_app.ignoreCount  = 0;
     g_app.ignoreActive = FALSE;
+    g_cachedPid        = 0;
+    g_cachedName[0]    = L'\0';
 }
 
 // ---------------------------------------------------------------------------
@@ -251,14 +270,28 @@ void Ignore_Recompute(void)
             DWORD pid = 0;
             GetWindowThreadProcessId(fg, &pid);
 
-            wchar_t name[CAPS_IGNORE_NAME_LEN];
-            if (pid != 0 && Process_GetImageBaseName(pid, name, ARRAYSIZE(name))) {
-                for (int i = 0; i < g_app.ignoreCount; ++i) {
-                    // 大小写不敏感：Windows 文件名本来就不区分大小写，
-                    // 用户在 ini 里写成 UU.EXE 也该生效。
-                    if (lstrcmpiW(name, g_app.ignoreApps[i]) == 0) {
-                        active = TRUE;
-                        break;
+            if (pid != 0) {
+                if (pid != g_cachedPid) {
+                    wchar_t name[CAPS_IGNORE_NAME_LEN];
+                    name[0] = L'\0';
+                    if (Process_GetImageBaseName(pid, name, ARRAYSIZE(name))) {
+                        lstrcpynW(g_cachedName, name, ARRAYSIZE(g_cachedName));
+                        g_cachedPid = pid;
+                    } else {
+                        // 查不到就不缓存 PID，下次还有机会重试。
+                        g_cachedPid = 0;
+                        g_cachedName[0] = L'\0';
+                    }
+                }
+
+                if (g_cachedName[0] != L'\0') {
+                    for (int i = 0; i < g_app.ignoreCount; ++i) {
+                        // 大小写不敏感：Windows 文件名本来就不区分大小写，
+                        // 用户在 ini 里写成 UU.EXE 也该生效。
+                        if (lstrcmpiW(g_cachedName, g_app.ignoreApps[i]) == 0) {
+                            active = TRUE;
+                            break;
+                        }
                     }
                 }
             }
@@ -289,6 +322,17 @@ void Ignore_ApplyConfig(const AppConfig* cfg)
         }
     }
 
+    // 记录启动时的前台进程 PID（只取 PID，不解析名字，开销可忽略）。
+    // 这样即使启动后一次窗口都没切过就打开「添加...」，选择器也有预选项。
+    HWND fg = GetForegroundWindow();
+    if (fg != NULL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        if (pid != 0 && pid != GetCurrentProcessId()) {
+            g_app.lastForegroundPid = pid;
+        }
+    }
+
     Ignore_Recompute();
 }
 
@@ -316,8 +360,13 @@ void Ignore_WriteConfig(AppConfig* cfg)
  * EVENT_SYSTEM_FOREGROUND 回调。
  *
  * 使用 WINEVENT_OUTOFCONTEXT：系统把事件投递到安装钩子的线程的消息队列，
- * 由 GetMessage/DispatchMessage 派发。因此这里可以安全地刷新托盘，
- * 也**不会**阻塞其他进程的输入处理。
+ * 由 GetMessage/DispatchMessage 派发。**这个线程同时也是低级键盘钩子的
+ * 宿主线程** —— 在这里做任何耗时操作（OpenProcess、Toolhelp 快照、
+ * Shell_NotifyIcon）都会把钩子回调的派发一起拖慢，表现为全局按键偶发
+ * 延迟；剪贴板图片的延迟渲染对这种时序尤其敏感。
+ *
+ * 因此本回调只做两件 O(1) 的事：记下前台进程 PID、投递一条消息。
+ * 进程名解析留给应用选择器按需执行，忽略判定与托盘刷新留给窗口过程。
  *
  * @param idObject / idChild 只处理「窗口对象本身」的事件，忽略子元素。
  */
@@ -341,22 +390,15 @@ static void CALLBACK OnForegroundEvent(HWINEVENTHOOK hook, DWORD event, HWND hwn
     }
 
     // 自己的窗口成为前台：不算「被忽略」。
-    // 同时刻意**不覆盖** lastForegroundApp —— 用户通常是「先切到目标程序，
-    // 再从托盘打开设置」，保留上一个外部进程名才能在选择器里预选中它。
-    if (pid == GetCurrentProcessId()) {
-        if (g_app.ignoreActive) {
-            g_app.ignoreActive = FALSE;
-            Tray_Refresh();
-        }
-        return;
+    // 同时刻意**不覆盖** lastForegroundPid —— 用户通常是「先切到目标程序，
+    // 再从托盘打开设置」，保留上一个外部 PID 才能在选择器里预选中它。
+    if (pid != GetCurrentProcessId()) {
+        g_app.lastForegroundPid = pid;
     }
 
-    wchar_t name[CAPS_IGNORE_NAME_LEN];
-    if (Process_GetImageBaseName(pid, name, ARRAYSIZE(name))) {
-        lstrcpynW(g_app.lastForegroundApp, name, ARRAYSIZE(g_app.lastForegroundApp));
+    if (g_app.hWnd != NULL) {
+        PostMessageW(g_app.hWnd, CAPS_WM_FOREGROUND, 0, 0);
     }
-
-    Ignore_Refresh();
 }
 
 BOOL Ignore_InstallWatcher(void)

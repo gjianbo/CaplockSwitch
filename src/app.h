@@ -64,6 +64,27 @@
  */
 #define CAPS_WM_TOGGLE         (WM_APP + 2)
 
+/**
+ * 「发送输入法切换快捷键」请求（钩子 -> 消息宿主窗口）。
+ *
+ * 和 CAPS_WM_TOGGLE 同理：SendInput 不能放在低级键盘钩子回调里做。
+ * 回调处在系统输入处理路径上，在那里注入按键会重入，且一旦输入法
+ * 吃掉修饰键的 KEYUP，Ctrl 就会卡在按下状态，把后续的 Ctrl+V / Ctrl+C
+ * 全部带坏。钩子只投递这条消息，注入由宿主窗口在正常消息循环里执行。
+ */
+#define CAPS_WM_SWITCH_HOTKEY  (WM_APP + 3)
+
+/**
+ * 「前台窗口变了」通知（WinEvent 回调 -> 消息宿主窗口）。
+ *
+ * SetWinEventHook 的回调与低级键盘钩子共用安装线程的消息循环，
+ * 在那里做 OpenProcess / Toolhelp 快照会连钩子回调一起拖住。
+ * 所以回调只记一个 PID 并投递本消息，真正的进程查询与托盘刷新
+ * 交给窗口过程；窗口过程也不在输入路径上，且只在确实配了忽略
+ * 应用时才会查询。
+ */
+#define CAPS_WM_FOREGROUND     (WM_APP + 4)
+
 /** 托盘图标在本进程内的唯一 ID。 */
 #define CAPS_TRAY_UID          1
 
@@ -210,6 +231,15 @@ BOOL Hook_Install(void);
 /** 卸载键盘钩子；未安装时无副作用。只在进程退出时调用。 */
 void Hook_Uninstall(void);
 
+/**
+ * 发送一次「切换输入法」快捷键（按当前 HotkeyMode）。
+ *
+ * **只能在消息宿主窗口收到 CAPS_WM_SWITCH_HOTKEY 后调用**，
+ * 绝不能在 LowLevelKeyboardProc 里直接调用 —— 见该消息常量的说明。
+ * 注入部分成功时，内部会尝试补发缺失的 KEYUP。
+ */
+void Hook_SendSwitchHotkey(HWND foreground);
+
 // ---------------------------------------------------------------------------
 // 托盘图标
 // ---------------------------------------------------------------------------
@@ -294,7 +324,15 @@ struct AppState {
     wchar_t ignoreApps[CAPS_MAX_IGNORE][CAPS_IGNORE_NAME_LEN];
     BOOL    ignoreActive;         // 当前前台进程是否命中忽略列表（钩子只读这一位）
     HWINEVENTHOOK hWinEvent;      // 前台窗口变化监听；安装失败时为 NULL
-    wchar_t lastForegroundApp[CAPS_IGNORE_NAME_LEN];  // 最近一个外部前台进程名
+    /**
+     * 最近一个外部前台进程的 PID，供应用选择器预选。
+     *
+     * 只存 PID 而不是解析好的进程名：解析需要 OpenProcess，遇到提权进程
+     * 还会退化成遍历全系统的 Toolhelp 快照。前台变化是高频事件，把这种
+     * 开销放在输入路径上会拖住同一线程里的键盘钩子。名字改成在用户点
+     * 「添加...」时按需解析一次，那里慢一点完全无感。
+     */
+    DWORD   lastForegroundPid;
 };
 
 /** 全局唯一状态实例。 */

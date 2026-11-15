@@ -244,6 +244,20 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         App_ToggleEnabled();
         return 0;
 
+    case CAPS_WM_SWITCH_HOTKEY:
+        // 来自键盘钩子的「单独按 Caps」。注入按键必须放在正常消息循环里：
+        // 若在钩子回调里 SendInput，注入的 Ctrl/Shift 一旦没被正常抬起，
+        // 就会卡在按下状态，把之后的 Ctrl+V / Ctrl+C 全部带坏。
+        Hook_SendSwitchHotkey((HWND)wParam);
+        return 0;
+
+    case CAPS_WM_FOREGROUND:
+        // 前台变化通知。进程名查询、忽略判定、托盘刷新统一在这里做，
+        // WinEvent 回调本身只记 PID + 投递消息，保持 O(1)。
+        // 没配置任何忽略应用时 Ignore_Recompute() 会立即返回，零开销。
+        Ignore_Refresh();
+        return 0;
+
     case WM_HOTKEY:
         if ((int)wParam == IDH_TOGGLE) {
             App_ToggleEnabled();

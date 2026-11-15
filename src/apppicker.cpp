@@ -137,6 +137,16 @@ static void FillList(void)
 
     SendMessageW(g_hList, LB_RESETCONTENT, 0, 0);
 
+    // 到这里才解析「最近一个外部前台程序」的名字。
+    // 前台变化回调只记录 PID，因为解析进程名要 OpenProcess、遇到提权
+    // 进程还要遍历 Toolhelp 快照 —— 那种开销不能放在输入路径上。
+    // 用户点开「添加...」时查一次，慢几十毫秒也完全无感。
+    wchar_t recent[CAPS_IGNORE_NAME_LEN];
+    recent[0] = L'\0';
+    if (g_app.lastForegroundPid != 0) {
+        Process_GetImageBaseName(g_app.lastForegroundPid, recent, ARRAYSIZE(recent));
+    }
+
     int preselect = 0;
     for (int i = 0; i < g_itemCount; ++i) {
         wchar_t line[CAPS_IGNORE_NAME_LEN + 100];
@@ -151,8 +161,8 @@ static void FillList(void)
 
         SendMessageW(g_hList, LB_ADDSTRING, 0, (LPARAM)line);
 
-        if (g_app.lastForegroundApp[0] != L'\0' &&
-            lstrcmpiW(g_items[i].exe, g_app.lastForegroundApp) == 0) {
+        if (recent[0] != L'\0' &&
+            lstrcmpiW(g_items[i].exe, recent) == 0) {
             preselect = i;
         }
     }

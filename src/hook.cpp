@@ -26,6 +26,12 @@
 //   2. 任何带 LLKHF_INJECTED 标志的事件一律放行（识别「非硬件」），
 //      保证程序只对物理键盘动作做决策。
 //
+// 回调里**不做任何实际工作**：切换启用状态投递 CAPS_WM_TOGGLE，
+// 发送输入法快捷键投递 CAPS_WM_SWITCH_HOTKEY，重判前台应用投递
+// CAPS_WM_FOREGROUND，全部由宿主窗口在正常消息循环里执行。
+// 尤其不能在回调里 SendInput —— 重入加上修饰键 KEYUP 可能被输入法吞掉，
+// 会让 Ctrl 卡在按下态，进而影响 Ctrl+V / Ctrl+C 这类组合键。
+//
 // 关于「为什么不用 Win + Caps」：Win 是系统保留修饰键，单独按下再抬起会弹
 // 开始菜单——因为 Caps 被钩子吞掉，系统认为 Win 是「孤儿键」。要抑制它就得
 // 再补发一个占位按键（AutoHotkey 的 #MenuMaskKey 就是这么做的，早期用
@@ -61,7 +67,7 @@ static DWORD g_ignoreCheckedAt = 0;
  * 当前前台应用是否在忽略列表中（命中则应把按键完全交还给系统）。
  *
  * 热路径上只读 g_app.ignoreActive 一个 BOOL：正常情况它由前台变化回调
- * 在消息循环里更新，这里不做任何进程查询。
+ * 投递消息后在消息循环里更新，这里不做任何进程查询。
  */
 static BOOL IsIgnoredForeground(void)
 {
@@ -69,14 +75,17 @@ static BOOL IsIgnoredForeground(void)
         return FALSE;
     }
 
-    // WinEvent 监听不可用时的兜底：限频 300ms 重算。
-    // 注意只调 Ignore_Recompute()，它不碰托盘、不碰界面 ——
-    // 钩子回调跑在系统输入处理路径上，这里不能做任何会阻塞的事。
+    // WinEvent 监听不可用时的兜底：限频 300ms 请求一次重算。
+    // 注意连 Ignore_Recompute() 都不在这里调 —— 它内部要 OpenProcess，
+    // 而钩子回调跑在系统输入处理路径上，任何进程查询都会拖慢全局按键。
+    // 只投递消息，让宿主窗口在消息循环里完成重算。
     if (g_app.hWinEvent == NULL) {
         const DWORD now = GetTickCount();
         if (now - g_ignoreCheckedAt >= 300) {
             g_ignoreCheckedAt = now;
-            Ignore_Recompute();
+            if (g_app.hWnd != NULL) {
+                PostMessageW(g_app.hWnd, CAPS_WM_FOREGROUND, 0, 0);
+            }
         }
     }
 
@@ -136,7 +145,10 @@ static BOOL IsAltOrWinDown(void)
  * 一次性把按下与抬起全部投递（先顺序按下，再逆序抬起），
  * 避免中间被其他输入打断。每个事件都打上 CAPS_SIGNATURE 签名。
  *
- * @param keys  按键序列，顺序即按下顺序。
+ * **调用约束：只能在宿主窗口的消息循环里调用，绝不能在
+ * LowLevelKeyboardProc 里调用** —— 见 CAPS_WM_SWITCH_HOTKEY 的说明。
+ *
+ * @param keys  按键序列，顺序即按下顺序；最后一个元素是主键。
  * @param count 序列长度，1..4。
  */
 static void SendKeyboardCombo(const WORD* keys, int count)
@@ -163,14 +175,32 @@ static void SendKeyboardCombo(const WORD* keys, int count)
         ++n;
     }
 
-    SendInput((UINT)n, input, sizeof(INPUT));
+    // 返回值必须看：SendInput 可能只插入前几个事件（UIPI 隔离、系统忙等）。
+    // 最坏情况是修饰键 DOWN 成功、KEYUP 没插进去 —— Ctrl 就此卡在按下态，
+    // 之后用户按 Ctrl+V / Ctrl+C 就会表现得莫名其妙。
+    const UINT sent = SendInput((UINT)n, input, sizeof(INPUT));
+
+    // 仅在部分事件入队时，补发仍缺失的抬起事件。单独补发已经入队的
+    // Ctrl KEYUP 可能恰好插在用户的 Ctrl 和 V 之间，导致粘贴失效。
+    if (sent > 0 && sent < (UINT)n) {
+        const UINT firstRelease = sent < (UINT)count ? (UINT)n - sent : sent;
+        SendInput((UINT)n - firstRelease, input + firstRelease, sizeof(INPUT));
+    }
 }
 
 /**
  * 按当前配置发送一次「切换输入法」快捷键。
+ *
+ * 由宿主窗口收到 CAPS_WM_SWITCH_HOTKEY 后调用；不要在钩子回调里直接调。
  */
-static void SendSwitchHotkey(void)
+void Hook_SendSwitchHotkey(HWND foreground)
 {
+    // 消息排队期间，焦点可能已经切换，用户也可能开始按 Ctrl+V。
+    if (GetForegroundWindow() != foreground || !g_app.enabled
+        || IsIgnoredForeground() || IsCtrlDown() || IsShiftDown() || IsAltOrWinDown()) {
+        return;
+    }
+
     switch (g_app.hotkeyMode) {
     case HOTKEY_WIN_SPACE:
         SendKeyboardCombo(kComboWinSpace, 2);
@@ -287,7 +317,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         // 只在「首次按下」发键；按住不放产生的自动重复被静默吞掉。
         if (!g_capsHeld) {
             g_capsHeld = TRUE;
-            SendSwitchHotkey();
+            // 不在这里 SendInput：钩子回调跑在系统输入处理路径上，注入
+            // 按键会重入，且修饰键 KEYUP 一旦被输入法吃掉就会污染后续
+            // 的 Ctrl+V / Ctrl+C。只投递消息，交给宿主窗口的消息循环。
+            if (g_app.hWnd != NULL) {
+                PostMessageW(g_app.hWnd, CAPS_WM_SWITCH_HOTKEY,
+                             (WPARAM)GetForegroundWindow(), 0);
+            }
         }
         return 1;   // 吞掉 KEYDOWN，阻止系统把大写状态切成 ON
     }
